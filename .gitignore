@@ -1,0 +1,15 @@
+node_modules/
+coverage/
+.env
+.env.*
+*.log
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+.DS_Store
+.idea/
+.vscode/
+*.tgz
+tmp/
