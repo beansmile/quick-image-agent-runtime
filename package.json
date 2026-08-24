@@ -1,0 +1,58 @@
+{
+  "name": "quick-image-agent-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Quick Image local processing runtime for agent hosts",
+  "type": "module",
+  "license": "LicenseRef-Quick-Image",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beansmile/quick-image-agent-runtime.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.19.0",
+  "bin": {
+    "quick-image-local-mcp": "./dist/server.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "clean": "rimraf dist coverage",
+    "check": "pnpm typecheck && pnpm test && pnpm build && pnpm validate && pnpm mcp:smoke && pnpm pack:check",
+    "dev": "tsx src/server.ts",
+    "mcp:smoke": "node scripts/smoke-mcp.mjs",
+    "pack:check": "npm pack --dry-run",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "validate": "node scripts/validate-package.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "ipaddr.js": "2.2.0",
+    "mediainfo.js": "0.3.7",
+    "sharp": "0.35.3",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "rimraf": "6.0.1",
+    "tsup": "8.5.0",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2",
+    "vitest": "3.2.4"
+  }
+}
