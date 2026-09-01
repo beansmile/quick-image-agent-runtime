@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -22,6 +22,7 @@ import { setOpenClawEnvironment } from "../src/environment/openclaw.js";
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
@@ -117,6 +118,58 @@ describe("Codex managed MCP override", () => {
     });
     expect(reset).toMatchObject({ host: "codex", source: "plugin-default", ...effective });
     await expect(readFile(configPath, "utf8")).resolves.toBe('model = "gpt-test"\n');
+  });
+});
+
+describe("Codex Plugin MCP manifests", () => {
+  it("updates both the marketplace checkout and installed plugin cache", async () => {
+    const directory = await temporaryDirectory();
+    const codexHome = path.join(directory, ".codex");
+    const marketplaceRoot = path.join(codexHome, ".tmp", "marketplaces", "quick-image");
+    const cacheRoot = path.join(codexHome, "plugins", "cache", "quick-image", "quick-image", "0.1.0");
+    vi.stubEnv("CODEX_HOME", codexHome);
+
+    await Promise.all([marketplaceRoot, cacheRoot].map((root) => writeCodexPluginFixture(root)));
+    const executor: CommandExecutor = {
+      run: vi.fn((_executable, args) => {
+        if (args[0] === "plugin" && args[1] === "list") {
+          return {
+            stdout: JSON.stringify({
+              installed: [{
+                pluginId: "quick-image@quick-image",
+                name: "quick-image",
+                marketplaceName: "quick-image",
+                version: "0.1.0",
+                enabled: true,
+                source: { source: "local", path: marketplaceRoot }
+              }]
+            }),
+            stderr: ""
+          };
+        }
+        return { stdout: "[]", stderr: "" };
+      })
+    };
+    const urls = {
+      serverUrl: "https://staging-api.example.com/mcp",
+      frontendUrl: "https://staging.example.com"
+    };
+
+    await setCodexEnvironment(urls, {
+      runtimeVersion: "0.2.0",
+      codexBin: "/bin/echo",
+      executor
+    });
+
+    for (const root of [marketplaceRoot, cacheRoot]) {
+      for (const fileName of [".mcp.json", "mcp.json"]) {
+        const manifest = JSON.parse(await readFile(path.join(root, fileName), "utf8"));
+        expect(manifest.mcpServers["quick-image"]).toMatchObject({
+          url: urls.serverUrl,
+          headers: { "X-Quick-Image-Frontend-URL": urls.frontendUrl }
+        });
+      }
+    }
   });
 });
 
@@ -240,4 +293,29 @@ async function temporaryDirectory(): Promise<string> {
   const directory = await mkdtemp(path.join(os.tmpdir(), "quick-image-env-test-"));
   temporaryDirectories.push(directory);
   return directory;
+}
+
+async function writeCodexPluginFixture(root: string): Promise<void> {
+  await mkdir(path.join(root, ".codex-plugin"), { recursive: true });
+  await writeFile(path.join(root, ".codex-plugin", "plugin.json"), JSON.stringify({
+    name: "quick-image",
+    version: "0.1.0",
+    mcpServers: "./.mcp.json"
+  }));
+  const manifest = JSON.stringify({
+    mcpServers: {
+      "quick-image": {
+        type: "http",
+        url: "https://quickimage.ai/mcp",
+        headers: {
+          "X-Quick-Image-Plugin-Version": "0.1.0",
+          "X-Quick-Image-Frontend-URL": "https://quickimage.ai"
+        }
+      }
+    }
+  });
+  await Promise.all([
+    writeFile(path.join(root, ".mcp.json"), manifest),
+    writeFile(path.join(root, "mcp.json"), manifest)
+  ]);
 }

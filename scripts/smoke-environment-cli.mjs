@@ -5,7 +5,9 @@ import { spawnSync } from "node:child_process";
 
 const root = await mkdtemp(path.join(os.tmpdir(), "quick-image-env-cli-smoke-"));
 const codexBin = path.join(root, "codex-fixture.mjs");
-const pluginRoot = path.join(root, "plugin");
+const codexHome = path.join(root, ".codex");
+const pluginRoot = path.join(codexHome, ".tmp", "marketplaces", "quick-image");
+const pluginCacheRoot = path.join(codexHome, "plugins", "cache", "quick-image", "quick-image", "0.1.0");
 const openClawBin = path.join(root, "openclaw-fixture.mjs");
 const openClawState = path.join(root, "openclaw-mcp.json");
 
@@ -14,7 +16,7 @@ try {
     "#!/usr/bin/env node",
     "const args = process.argv.slice(2);",
     "if (args[0] === 'plugin' && args[1] === 'list') {",
-    `  process.stdout.write(JSON.stringify({ installed: [{ name: 'quick-image', enabled: true, source: { path: '${pluginRoot}' } }] }));`,
+    `  process.stdout.write(JSON.stringify({ installed: [{ pluginId: 'quick-image@quick-image', name: 'quick-image', marketplaceName: 'quick-image', version: '0.1.0', enabled: true, source: { path: '${pluginRoot}' } }] }));`,
     "} else if (args[0] === 'mcp' && args[1] === 'get') {",
     "  process.stdout.write(JSON.stringify({ transport: {",
     "    url: 'https://staging-api.example.com/mcp',",
@@ -29,7 +31,14 @@ try {
     ""
   ].join("\n"), { mode: 0o700 });
   await chmod(codexBin, 0o700);
-  await mkdir(pluginRoot, { recursive: true });
+  await Promise.all([pluginRoot, pluginCacheRoot].map(async (directory) => {
+    await mkdir(path.join(directory, ".codex-plugin"), { recursive: true });
+    await writeFile(path.join(directory, ".codex-plugin", "plugin.json"), JSON.stringify({
+      name: "quick-image",
+      version: "0.1.0",
+      mcpServers: "./.mcp.json"
+    }));
+  }));
   const manifest = JSON.stringify({
     mcpServers: {
       "quick-image": {
@@ -41,8 +50,10 @@ try {
       }
     }
   });
-  await writeFile(path.join(pluginRoot, ".mcp.json"), manifest);
-  await writeFile(path.join(pluginRoot, "mcp.json"), manifest);
+  await Promise.all([pluginRoot, pluginCacheRoot].flatMap((directory) => [
+    writeFile(path.join(directory, ".mcp.json"), manifest),
+    writeFile(path.join(directory, "mcp.json"), manifest)
+  ]));
 
   const result = spawnSync(process.execPath, [
     path.join(process.cwd(), "dist", "cli", "quick-image.js"),
@@ -56,18 +67,20 @@ try {
     "https://staging.example.com",
     "--codex-bin",
     codexBin,
-  ], { encoding: "utf8" });
+  ], { encoding: "utf8", env: { ...process.env, CODEX_HOME: codexHome } });
 
   if (result.status !== 0) {
     throw new Error(`environment CLI failed: ${(result.stderr || result.stdout).trim()}`);
   }
-  const config = await readFile(path.join(pluginRoot, ".mcp.json"), "utf8");
-  const parsedConfig = JSON.parse(config);
-  if (parsedConfig.mcpServers?.["quick-image"]?.url !== "https://staging-api.example.com/mcp") {
-    throw new Error("environment CLI did not update the Codex Plugin manifest");
-  }
-  if (parsedConfig.mcpServers?.["quick-image"]?.headers?.["X-Quick-Image-Plugin-Version"] !== "0.1.0") {
-    throw new Error("environment CLI unexpectedly changed the Codex Plugin version");
+  for (const directory of [pluginRoot, pluginCacheRoot]) {
+    const config = await readFile(path.join(directory, ".mcp.json"), "utf8");
+    const parsedConfig = JSON.parse(config);
+    if (parsedConfig.mcpServers?.["quick-image"]?.url !== "https://staging-api.example.com/mcp") {
+      throw new Error("environment CLI did not update every Codex Plugin manifest");
+    }
+    if (parsedConfig.mcpServers?.["quick-image"]?.headers?.["X-Quick-Image-Plugin-Version"] !== "0.1.0") {
+      throw new Error("environment CLI unexpectedly changed the Codex Plugin version");
+    }
   }
 
   await writeFile(openClawBin, [

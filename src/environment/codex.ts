@@ -162,13 +162,18 @@ function codexRuntime(options: CodexOptions) {
 }
 
 async function setCodexManifestEnvironment(urls: EnvironmentUrls, options: CodexOptions): Promise<EnvironmentStatus> {
-  const root = await resolvePluginRoot(options);
-  const files = [path.join(root, ".mcp.json"), path.join(root, "mcp.json")];
-  const originals = await Promise.all(files.map((file) => readJsonFile(file)));
+  const roots = await resolvePluginRoots(options);
+  const files = [...new Set((await Promise.all(roots.map(resolvePluginManifestFiles))).flat())];
+  const originals = new Map<string, Record<string, unknown>>();
+  for (const file of files) originals.set(file, await readJsonFile(file));
+  const written: string[] = [];
   try {
-    await Promise.all(files.map((file, index) => writeJsonAtomic(file, updateManifest(originals[index]!, urls))));
+    for (const file of files) {
+      await writeJsonAtomic(file, updateManifest(originals.get(file)!, urls));
+      written.push(file);
+    }
   } catch (error) {
-    await Promise.all(files.map((file, index) => writeJsonAtomic(file, originals[index]!)));
+    await Promise.all(written.map((file) => writeJsonAtomic(file, originals.get(file)!)));
     throw error;
   }
   return { host: "codex", configured: true, source: "custom", ...urls, authenticationCommand: "codex mcp login quick-image" };
@@ -183,7 +188,9 @@ async function resetCodexManifestEnvironment(options: CodexOptions): Promise<Env
 
 async function readCodexManifestStatus(options: CodexOptions): Promise<EnvironmentStatus> {
   try {
-    const manifest = await readJsonFile(path.join(await resolvePluginRoot(options), ".mcp.json"));
+    const roots = await resolvePluginRoots(options);
+    const files = await resolvePluginManifestFiles(roots.at(-1)!);
+    const manifest = await readJsonFile(files[0]!);
     const servers = isObject(manifest.mcpServers) ? manifest.mcpServers : {};
     const server = isObject(servers[QUICK_IMAGE_MCP_NAME]) ? servers[QUICK_IMAGE_MCP_NAME] : {};
     const headers = isObject(server.headers) ? server.headers : {};
@@ -202,17 +209,50 @@ async function readCodexManifestStatus(options: CodexOptions): Promise<Environme
   }
 }
 
-async function resolvePluginRoot(options: CodexOptions): Promise<string> {
+async function resolvePluginRoots(options: CodexOptions): Promise<string[]> {
   const runtime = codexRuntime(options);
   const output = runtime.executor.run(runtime.codexBin, ["plugin", "list", "--json"]).stdout;
   let value: unknown;
   try { value = JSON.parse(output); } catch { throw new Error("Codex Plugin 列表输出不是有效 JSON"); }
   if (!isObject(value) || !Array.isArray(value.installed)) throw new Error("Codex Plugin 列表输出格式无效");
   const matches = value.installed.filter((item) => isObject(item) && item.name === "quick-image" && item.enabled !== false);
-  if (matches.length !== 1 || !isObject(matches[0]) || !isObject(matches[0].source) || typeof matches[0].source.path !== "string") {
+  if (matches.length !== 1 || !isObject(matches[0]) || !isObject(matches[0].source) ||
+      typeof matches[0].source.path !== "string" || typeof matches[0].marketplaceName !== "string" ||
+      typeof matches[0].name !== "string" || typeof matches[0].version !== "string") {
     throw new Error("无法从 Codex Plugin 列表定位唯一且已启用的 quick-image 安装目录");
   }
-  return path.resolve(matches[0].source.path);
+  const marketplaceName = safePluginPathSegment(matches[0].marketplaceName, "Marketplace 名称");
+  const pluginName = safePluginPathSegment(matches[0].name, "Plugin 名称");
+  const version = safePluginPathSegment(matches[0].version, "Plugin 版本");
+  const marketplaceRoot = path.resolve(matches[0].source.path);
+  const cacheRoot = path.join(resolveCodexHome(), "plugins", "cache", marketplaceName, pluginName, version);
+  return [...new Set([marketplaceRoot, cacheRoot])];
+}
+
+async function resolvePluginManifestFiles(root: string): Promise<string[]> {
+  const pluginManifestPath = path.join(root, ".codex-plugin", "plugin.json");
+  const pluginManifest = await readJsonFile(pluginManifestPath);
+  if (typeof pluginManifest.mcpServers !== "string") {
+    throw new Error(`Codex Plugin 清单未通过文件配置 MCP：${pluginManifestPath}`);
+  }
+  const codexMcpPath = resolvePathInsideRoot(root, pluginManifest.mcpServers);
+  return [...new Set([codexMcpPath, path.join(root, "mcp.json")])];
+}
+
+function resolvePathInsideRoot(root: string, relativePath: string): string {
+  const resolvedRoot = path.resolve(root);
+  const resolved = path.resolve(resolvedRoot, relativePath);
+  if (resolved !== resolvedRoot && !resolved.startsWith(`${resolvedRoot}${path.sep}`)) {
+    throw new Error(`Codex MCP 清单路径超出 Plugin 目录：${relativePath}`);
+  }
+  return resolved;
+}
+
+function safePluginPathSegment(value: string, label: string): string {
+  if (value.length === 0 || value === "." || value === ".." || value.includes("/") || value.includes("\\")) {
+    throw new Error(`Codex ${label}不是安全的路径段：${value}`);
+  }
+  return value;
 }
 
 async function readJsonFile(filePath: string): Promise<Record<string, unknown>> {
@@ -254,8 +294,12 @@ function readEffectiveCodexConfig(runtime: ReturnType<typeof codexRuntime>): Cod
 }
 
 function resolveCodexConfigPath(): string {
+  return path.join(resolveCodexHome(), "config.toml");
+}
+
+function resolveCodexHome(): string {
   const codexHome = process.env.CODEX_HOME?.trim();
-  return path.join(codexHome ? path.resolve(codexHome) : path.join(os.homedir(), ".codex"), "config.toml");
+  return codexHome ? path.resolve(codexHome) : path.join(os.homedir(), ".codex");
 }
 
 async function readCodexConfig(configPath: string): Promise<string> {
