@@ -2,7 +2,9 @@ import os from "node:os";
 import path from "node:path";
 import { PluginError } from "./errors.js";
 
-export function assertSupportedRuntime(): void {
+export function assertSupportedRuntime(platform = process.platform): void {
+  // 保留平台参数用于宿主/测试注入；当前平台差异不构成本地运行时的硬阻断。
+  void platform;
   const major = Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10);
   if (!Number.isFinite(major) || major < 20) {
     throw new PluginError("NODE_VERSION_UNSUPPORTED", "Quick Image 本地附件处理核心需要 Node.js 20 或更高版本。", {
@@ -12,11 +14,6 @@ export function assertSupportedRuntime(): void {
     });
   }
 
-  if (process.platform === "win32") {
-    throw new PluginError("NATIVE_WINDOWS_UNSUPPORTED", "Quick Image P0 不支持原生 Windows。", {
-      suggested_action: "请在 Windows WSL2 中安装并运行插件。"
-    });
-  }
 }
 
 export async function assertRuntimeDependencies(): Promise<void> {
