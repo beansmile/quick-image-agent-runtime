@@ -1,6 +1,6 @@
 {
   "name": "quick-image-agent-runtime",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Quick Image local processing runtime for agent hosts",
   "type": "module",
@@ -14,6 +14,8 @@
   },
   "packageManager": "pnpm@10.19.0",
   "bin": {
+    "quick-image": "./dist/cli/quick-image.js",
+    "quick-image-doctor": "./dist/cli/doctor.js",
     "quick-image-local-mcp": "./dist/server.js"
   },
   "main": "./dist/index.js",
@@ -32,8 +34,11 @@
   "scripts": {
     "build": "tsup",
     "clean": "rimraf dist coverage",
-    "check": "pnpm typecheck && pnpm test && pnpm build && pnpm validate && pnpm mcp:smoke && pnpm pack:check",
+    "check": "pnpm typecheck && pnpm test && pnpm build && pnpm validate && pnpm cli:smoke && pnpm mcp:smoke && pnpm pack:check",
+    "cli:smoke": "node scripts/smoke-environment-cli.mjs",
     "dev": "tsx src/server.ts",
+    "doctor": "tsx src/cli/doctor.ts",
+    "quick-image": "tsx src/cli/quick-image.ts",
     "mcp:smoke": "node scripts/smoke-mcp.mjs",
     "pack:check": "npm pack --dry-run",
     "test": "vitest run",
@@ -43,6 +48,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "ipaddr.js": "2.2.0",
+    "json5": "2.2.3",
     "mediainfo.js": "0.3.7",
     "sharp": "0.35.3",
     "zod": "3.25.76"
