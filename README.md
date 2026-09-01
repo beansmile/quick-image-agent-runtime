@@ -18,14 +18,14 @@ Quick Image Agent Runtime 是 Quick Image Agent Plugin 使用的本地处理运�
     "args": [
       "--yes",
       "--package",
-      "https://github.com/beansmile/quick-image-agent-runtime/releases/download/v0.2.0/quick-image-agent-runtime-0.2.0.tgz",
+      "https://github.com/beansmile/quick-image-agent-runtime/releases/download/v0.2.1/quick-image-agent-runtime-0.2.1.tgz",
       "quick-image-local-mcp"
     ]
   }
 }
 ```
 
-首次启动需要联网安装运行时依赖。`sharp` 会按当前操作系统和 CPU 架构安装对应的原生包，不会下载所有平台的二进制。
+首次启动需要联网安装运行时依赖。WSL2 是 Windows 的主要兼容目标；原生 Windows 也会尝试运行，但不承诺所有媒体依赖和宿主组合都兼容。`sharp` 会按当前操作系统和 CPU 架构安装对应的原生包，不会下载所有平台的二进制。
 
 ## 环境切换 CLI
 
