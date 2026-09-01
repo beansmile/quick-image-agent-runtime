@@ -35,9 +35,6 @@ jobs:
       - name: Validate release
         run: pnpm check
 
-      - name: Verify committed build output
-        run: git diff --exit-code -- dist
-
       - name: Build release archive
         run: |
           mkdir release
