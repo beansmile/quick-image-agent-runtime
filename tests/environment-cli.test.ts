@@ -205,7 +205,7 @@ describe("OpenClaw environment adapter", () => {
     expect(calls.map((args) => args.slice(0, 2))).toEqual([
       ["config", "get"],
       ["mcp", "set"],
-      ["gateway", "restart"],
+      ["mcp", "reload"],
       ["config", "get"]
     ]);
     expect(JSON.parse(calls[1]![3]!)).toMatchObject({
@@ -261,7 +261,7 @@ describe("OpenClaw environment adapter", () => {
     expect(calls.map((args) => args.slice(0, 2))).toEqual([
       ["config", "get"],
       ["mcp", "set"],
-      ["gateway", "restart"],
+      ["mcp", "reload"],
       ["config", "get"]
     ]);
   });

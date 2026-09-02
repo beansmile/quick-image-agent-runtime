@@ -18,7 +18,7 @@ Quick Image Agent Runtime 是 Quick Image Agent Plugin 使用的本地处理运�
     "args": [
       "--yes",
       "--package",
-      "https://github.com/beansmile/quick-image-agent-runtime/releases/download/v0.2.1/quick-image-agent-runtime-0.2.1.tgz",
+      "https://github.com/beansmile/quick-image-agent-runtime/releases/download/v0.2.2/quick-image-agent-runtime-0.2.2.tgz",
       "quick-image-local-mcp"
     ]
   }
@@ -47,7 +47,7 @@ quick-image env status --host <codex|openclaw|all>
 quick-image env reset --host <codex|openclaw|all>
 ```
 
-完整执行时，上述两条命令同样需要加上 `npx --yes --package <Runtime Release tgz>` 前缀。Codex 会通过 `codex plugin list --json` 自动定位 Quick Image Plugin 的 Marketplace 工作副本，并根据返回的 Marketplace、Plugin 与版本信息定位 `plugins/cache` 中的实际安装缓存；两处的 Codex MCP 清单和 `mcp.json` 会同步更新，只修改 `quick-image` 服务并保留其他服务，任一写入失败都会回滚。OpenClaw 通过宿主的 `mcp set` 和 Gateway 重启生效。切换地址不会读取、迁移或复用 OAuth 凭据，完成后必须按命令输出重新登录对应的 `quick-image` MCP。Codex 还需要新建任务加载新配置。
+完整执行时，上述两条命令同样需要加上 `npx --yes --package <Runtime Release tgz>` 前缀。Codex 会通过 `codex plugin list --json` 自动定位 Quick Image Plugin 的 Marketplace 工作副本，并根据返回的 Marketplace、Plugin 与版本信息定位 `plugins/cache` 中的实际安装缓存；两处的 Codex MCP 清单和 `mcp.json` 会同步更新，只修改 `quick-image` 服务并保留其他服务，任一写入失败都会回滚。OpenClaw 通过宿主的 `mcp set` 和 `mcp reload` 生效。切换地址不会读取、迁移或复用 OAuth 凭据，完成后必须按命令输出重新登录对应的 `quick-image` MCP。Codex 还需要新建任务加载新配置。
 
 同一个 Runtime Release tgz 还提供安装诊断命令：
 

@@ -26,7 +26,7 @@ export async function setOpenClawEnvironment(
   headers[QUICK_IMAGE_FRONTEND_HEADER] = urls.frontendUrl;
   const updatedConfig = { ...config, url: urls.serverUrl, headers };
   runtime.executor.run(runtime.openClawBin, ["mcp", "set", QUICK_IMAGE_MCP_NAME, JSON.stringify(updatedConfig)]);
-  runtime.executor.run(runtime.openClawBin, ["gateway", "restart"]);
+  runtime.executor.run(runtime.openClawBin, ["mcp", "reload"]);
   const status = await readOpenClawEnvironmentStatus(options);
   if (!status.configured || status.serverUrl !== urls.serverUrl || status.frontendUrl !== urls.frontendUrl) {
     throw new Error("OpenClaw 未加载刚写入的 Quick Image MCP 配置");
