@@ -39,8 +39,9 @@ jobs:
         run: |
           mkdir release
           npm pack --pack-destination release
+          mv release/quick-image-agent-runtime-*.tgz release/quick-image-agent-runtime.tgz
           cd release
-          sha256sum *.tgz > SHA256SUMS
+          sha256sum quick-image-agent-runtime.tgz > SHA256SUMS
 
       - name: Create GitHub Release
         env:
