@@ -17,8 +17,9 @@ Quick Image Agent Runtime 是 Quick Image Agent Plugin 使用的本地处理运�
     "command": "npx",
     "args": [
       "--yes",
+      "--prefer-online",
       "--package",
-      "https://github.com/beansmile/quick-image-agent-runtime/releases/download/v0.2.2/quick-image-agent-runtime-0.2.2.tgz",
+      "https://github.com/beansmile/quick-image-agent-runtime/releases/download/v<version>/quick-image-agent-runtime.tgz",
       "quick-image-local-mcp"
     ]
   }
@@ -32,8 +33,8 @@ Quick Image Agent Runtime 是 Quick Image Agent Plugin 使用的本地处理运�
 Runtime Release tgz 同时提供 `quick-image` 命令，供维护者显式覆盖 Codex 或 OpenClaw 当前使用的远程 MCP 和前端地址。地址由命令调用者传入，不保存在 Runtime 源码或发布产物中：
 
 ```bash
-npx --yes \
-  --package https://github.com/beansmile/quick-image-agent-runtime/releases/download/v<version>/quick-image-agent-runtime-<version>.tgz \
+npx --yes --prefer-online \
+  --package https://github.com/beansmile/quick-image-agent-runtime/releases/download/v<version>/quick-image-agent-runtime.tgz \
   quick-image env set \
   --host codex \
   --server-url https://<server>/mcp \
@@ -47,13 +48,13 @@ quick-image env status --host <codex|openclaw|all>
 quick-image env reset --host <codex|openclaw|all>
 ```
 
-完整执行时，上述两条命令同样需要加上 `npx --yes --package <Runtime Release tgz>` 前缀。Codex 会通过 `codex plugin list --json` 自动定位 Quick Image Plugin 的 Marketplace 工作副本，并根据返回的 Marketplace、Plugin 与版本信息定位 `plugins/cache` 中的实际安装缓存；两处的 Codex MCP 清单和 `mcp.json` 会同步更新，只修改 `quick-image` 服务并保留其他服务，任一写入失败都会回滚。OpenClaw 通过宿主的 `mcp set` 和 `mcp reload` 生效。切换地址不会读取、迁移或复用 OAuth 凭据，完成后必须按命令输出重新登录对应的 `quick-image` MCP。Codex 还需要新建任务加载新配置。
+完整执行时，上述两条命令同样需要加上 `npx --yes --prefer-online --package <Runtime Release tgz>` 前缀。Codex 会通过 `codex plugin list --json` 自动定位 Quick Image Plugin 的 Marketplace 工作副本，并根据返回的 Marketplace、Plugin 与版本信息定位 `plugins/cache` 中的实际安装缓存；两处的 Codex MCP 清单和 `mcp.json` 会同步更新，只修改 `quick-image` 服务并保留其他服务，任一写入失败都会回滚。OpenClaw 通过宿主的 `mcp set` 和 `mcp reload` 生效。切换地址不会读取、迁移或复用 OAuth 凭据，完成后必须按命令输出重新登录对应的 `quick-image` MCP。Codex 还需要新建任务加载新配置。
 
 同一个 Runtime Release tgz 还提供安装诊断命令：
 
 ```bash
-npx --yes \
-  --package https://github.com/beansmile/quick-image-agent-runtime/releases/download/v<version>/quick-image-agent-runtime-<version>.tgz \
+npx --yes --prefer-online \
+  --package https://github.com/beansmile/quick-image-agent-runtime/releases/download/v<version>/quick-image-agent-runtime.tgz \
   quick-image-doctor --host <codex|openclaw>
 ```
 
@@ -77,4 +78,4 @@ pnpm check
 3. 提交源码、测试和发布配置，不提交 `dist/`。
 4. 创建并推送匹配的 tag，例如稳定版 `v0.2.0` 或预发布版 `v0.2.0-rc.1`。
 
-GitHub Actions 会验证 tag 与包版本一致，从源码重新构建 Runtime，并将 tgz 和 SHA-256 摘要上传到 GitHub Release；带预发布后缀的 tag 会标记为 Prerelease。Quick Image Agent Plugin 的 MCP 清单和 OpenClaw 依赖都固定引用所选版本的 Release tgz。
+GitHub Actions 会验证 tag 与包版本一致，从源码重新构建 Runtime，并以固定资产名 `quick-image-agent-runtime.tgz` 连同 SHA-256 摘要上传到 GitHub Release；带预发布后缀的 tag 会标记为 Prerelease。Quick Image Agent Plugin 的 MCP 清单和 OpenClaw 依赖都通过 tag 固定引用所选版本的 Release tgz。
