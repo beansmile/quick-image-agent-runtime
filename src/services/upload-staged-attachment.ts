@@ -21,8 +21,10 @@ export class UploadStagedAttachmentService {
     directUpload: DirectUpload,
     scopeDigest?: string
   ): Promise<{ asset_id: string }> {
-    const uploadUrl = this.targetPolicy.assertUrl(directUpload.upload_url);
     validateDirectUpload(directUpload);
+    const uploadUrl = directUpload.upload_required === false
+      ? undefined
+      : this.targetPolicy.assertUrl(directUpload.upload_url);
 
     return this.store.withStage(stagedHandle, async (record, stagedFilePath) => {
       const buffer = await readFile(stagedFilePath);
@@ -34,8 +36,10 @@ export class UploadStagedAttachmentService {
         });
       }
 
+      if (directUpload.upload_required === false) return { asset_id: directUpload.asset_id };
+
       const headers = validateHeaders(directUpload.headers, record.size, record.content_type);
-      await this.uploader(uploadUrl, headers, buffer, this.targetPolicy.lookup);
+      await this.uploader(uploadUrl!, headers, buffer, this.targetPolicy.lookup);
       return { asset_id: directUpload.asset_id };
     }, scopeDigest);
   }
@@ -47,6 +51,8 @@ function validateDirectUpload(directUpload: DirectUpload): void {
       field: "direct_upload.asset_id"
     });
   }
+  if (directUpload.upload_required === false) return;
+
   const expires = Date.parse(directUpload.expires_at);
   const now = Date.now();
   if (!Number.isFinite(expires) || expires <= now || expires > now + HANDLE_TTL_MS + 5 * 60 * 1000) {

@@ -70,9 +70,17 @@ export interface PreparedAttachmentResult {
   expires_at: string;
 }
 
-export interface DirectUpload {
+export interface RequiredDirectUpload {
   asset_id: string;
+  upload_required?: true | undefined;
   upload_url: string;
   headers: Record<string, string>;
   expires_at: string;
 }
+
+export interface ReusedDirectUpload {
+  asset_id: string;
+  upload_required: false;
+}
+
+export type DirectUpload = RequiredDirectUpload | ReusedDirectUpload;

@@ -133,7 +133,7 @@ async function main(): Promise<void> {
     "upload_staged_attachment",
     {
       title: "上传 Quick Image 暂存附件",
-      description: "使用远程 Quick Image MCP 签发的完整直传信息上传完全相同的暂存文件，成功后消费句柄。",
+      description: "使用远程 Quick Image MCP 返回的完整信息上传暂存文件，或复用已验证素材；成功后消费句柄。",
       inputSchema: z.object({
         staged_handle: z.string().describe("prepare_attachment 返回的一次性暂存句柄"),
         direct_upload: directUploadSchema.describe("create_direct_upload 返回的完整直传信息，不得手工修改")
