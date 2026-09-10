@@ -35,12 +35,21 @@ export const inspectedOutputSchema = z.object({
   expires_at: z.string().datetime()
 });
 
-export const directUploadSchema = z.object({
-  asset_id: z.string().min(1).max(200),
-  upload_url: z.string().url().max(8192),
-  headers: z.record(z.string()),
-  expires_at: z.string().datetime({ offset: true })
-});
+const directUploadAssetIdSchema = z.string().min(1).max(200);
+
+export const directUploadSchema = z.union([
+  z.object({
+    asset_id: directUploadAssetIdSchema,
+    upload_required: z.literal(false)
+  }).strict(),
+  z.object({
+    asset_id: directUploadAssetIdSchema,
+    upload_required: z.literal(true).optional(),
+    upload_url: z.string().url().max(8192),
+    headers: z.record(z.string()),
+    expires_at: z.string().datetime({ offset: true })
+  }).strict()
+]);
 
 const confirmationThresholdsSchema = z4.object({
   output_count: z4.number().int().positive(),

@@ -5,6 +5,7 @@ import path from "node:path";
 import type { LookupFunction } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { UploadTargetPolicy } from "../src/security/upload-target.js";
+import { directUploadSchema } from "../src/contracts/local-tool-schemas.js";
 import { UploadStagedAttachmentService } from "../src/services/upload-staged-attachment.js";
 import { HandleStore } from "../src/store/handle-store.js";
 
@@ -15,6 +16,19 @@ afterEach(async () => {
 });
 
 describe("UploadStagedAttachmentService", () => {
+  it("accepts both reusable and legacy upload-required responses", () => {
+    expect(directUploadSchema.parse({ asset_id: "asset_test_123", upload_required: false })).toEqual({
+      asset_id: "asset_test_123",
+      upload_required: false
+    });
+    expect(directUploadSchema.parse({
+      asset_id: "asset_test_123",
+      upload_url: "https://uploads.quickimage.ai/object?signature=redacted",
+      headers: {},
+      expires_at: new Date(Date.now() + 60_000).toISOString()
+    })).toMatchObject({ asset_id: "asset_test_123" });
+  });
+
   it("uploads exactly the staged bytes and consumes the handle after success", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "quick-image-upload-test-"));
     temporaryDirectories.push(root);
@@ -44,6 +58,36 @@ describe("UploadStagedAttachmentService", () => {
 
     await expect(service.execute(stagedHandle, directUpload)).resolves.toEqual({ asset_id: "asset_test_123" });
     expect(uploader).toHaveBeenCalledOnce();
+    await expect(service.execute(stagedHandle, directUpload)).rejects.toMatchObject({
+      code: "STAGED_HANDLE_NOT_FOUND"
+    });
+  });
+
+  it("consumes the staged handle without PUT when the server reuses a verified asset", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "quick-image-upload-test-"));
+    temporaryDirectories.push(root);
+    const store = new HandleStore(path.join(root, "state"));
+    await store.initialize();
+    const buffer = Buffer.from("reused staged bytes");
+    const stagedHandle = await store.createStage(buffer, {
+      record_type: "staged",
+      content_type: "image/png",
+      size: buffer.length,
+      checksum: `sha256:${createHash("sha256").update(buffer).digest("hex")}`,
+      expires_at: new Date(Date.now() + 60_000).toISOString()
+    });
+    const lookup = (() => undefined) as unknown as LookupFunction;
+    const policy: UploadTargetPolicy = { assertUrl: vi.fn(), lookup };
+    const uploader = vi.fn();
+    const service = new UploadStagedAttachmentService(store, policy, uploader);
+    const directUpload = {
+      asset_id: "asset_test_123",
+      upload_required: false as const
+    };
+
+    await expect(service.execute(stagedHandle, directUpload)).resolves.toEqual({ asset_id: "asset_test_123" });
+    expect(policy.assertUrl).not.toHaveBeenCalled();
+    expect(uploader).not.toHaveBeenCalled();
     await expect(service.execute(stagedHandle, directUpload)).rejects.toMatchObject({
       code: "STAGED_HANDLE_NOT_FOUND"
     });
