@@ -26,9 +26,9 @@ async function main(): Promise<void> {
     "inspect_attachment",
     {
       title: "检查 Quick Image 附件",
-      description: "读取 Codex 当前对话明确提供并经宿主批准的绝对路径，校验媒体并返回不包含附件字节的轻量检查句柄。此步骤不压缩、不暂存、不上传附件。",
+      description: "读取宿主或 AI 根据用户意图提供的本地文件绝对路径或 Runtime 支持的媒体引用；仅校验文件身份、格式、大小和限制校验所需的技术元数据，不分析图片、音频或视频内容。返回不包含附件字节的轻量检查句柄。此步骤不压缩、不暂存、不上传附件。",
       inputSchema: z.object({
-        path: z.string().min(1).describe("Codex 当前对话附件明确提供的绝对本地路径；调用前必须由宿主向用户显示工具审批")
+        path: z.string().min(1).describe("宿主或 AI 根据用户意图提供的本地文件绝对路径或 Runtime 支持的媒体引用")
       }),
       outputSchema: inspectedOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false }
