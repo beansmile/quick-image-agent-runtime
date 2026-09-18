@@ -35,6 +35,12 @@ export const inspectedOutputSchema = z.object({
   expires_at: z.string().datetime()
 });
 
+export const downloadedPreviewOutputSchema = z.object({
+  file_path: z.string().describe("下载到本地私有缓存的预览文件绝对路径"),
+  content_type: z.string().min(1).describe("magic bytes 检测出的预览 MIME 类型（image/jpeg、image/png 或 image/webp）"),
+  bytes: z.number().int().positive().describe("预览文件字节数")
+});
+
 const directUploadAssetIdSchema = z.string().min(1).max(200);
 
 export const directUploadSchema = z.union([

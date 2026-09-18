@@ -18,6 +18,7 @@ try {
   const result = await client.listTools();
   const names = result.tools.map((tool) => tool.name).sort();
   const expected = [
+    "download_preview_media",
     "estimate_lookbook_credits",
     "estimate_pose_credits",
     "estimate_upscale_credits",
@@ -154,6 +155,13 @@ try {
   const missing = await client.callTool({ name: "inspect_attachment", arguments: { path: missingPath } });
   if (!missing.isError || JSON.stringify(missing).includes(missingPath)) {
     throw new Error("inspect_attachment did not redact a local filesystem error");
+  }
+  const insecurePreview = await client.callTool({
+    name: "download_preview_media",
+    arguments: { display_url: "http://media.example.com/preview.jpg" }
+  });
+  if (!insecurePreview.isError || !JSON.stringify(insecurePreview).includes("PREVIEW_URL_REJECTED")) {
+    throw new Error("download_preview_media accepted a non-HTTPS preview URL");
   }
   const imagePath = path.join(stateDirectory, "smoke.png");
   await writeFile(imagePath, await sharp({
