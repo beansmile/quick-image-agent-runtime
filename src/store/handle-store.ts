@@ -1,9 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
-  chmod,
-  lstat,
-  mkdir,
   open,
   readFile,
   readdir,
@@ -16,9 +13,15 @@ import {
 import path from "node:path";
 import { HANDLE_TTL_MS } from "../constants.js";
 import { PluginError } from "../errors.js";
+import { ensurePrivateDirectory } from "../security/private-directory.js";
 import type { InspectedAttachment, StagedAttachment } from "../types.js";
 
 const STALE_LEASE_MS = 10 * 60 * 1000;
+const STATE_DIRECTORY_POLICY = {
+  code: "INSECURE_STATE_DIRECTORY",
+  message: "本地附件处理状态目录不安全。",
+  suggestedAction: "将 QUICK_IMAGE_DATA_DIR 指向仅当前用户可访问的真实目录。"
+};
 
 interface Claim<T> {
   record: T;
@@ -83,7 +86,7 @@ export class HandleStore {
   }
 
   async initialize(): Promise<void> {
-    await ensurePrivateDirectory(this.root);
+    await ensurePrivateDirectory(this.root, STATE_DIRECTORY_POLICY);
     await Promise.all([
       rm(path.join(this.root, "handles"), { recursive: true, force: true }),
       rm(path.join(this.root, "captured-records"), { recursive: true, force: true }),
@@ -94,7 +97,7 @@ export class HandleStore {
       this.stagedRecordsDirectory,
       this.stagedFilesDirectory
     ]) {
-      await ensurePrivateDirectory(directory);
+      await ensurePrivateDirectory(directory, STATE_DIRECTORY_POLICY);
     }
     await this.cleanupExpired();
   }
@@ -338,15 +341,4 @@ export class HandleStore {
     }
     return activeFileIds;
   }
-}
-
-async function ensurePrivateDirectory(directory: string): Promise<void> {
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const details = await lstat(directory);
-  if (!details.isDirectory() || details.isSymbolicLink()) {
-    throw new PluginError("INSECURE_STATE_DIRECTORY", "本地附件处理状态目录不安全。", {
-      suggested_action: "将 QUICK_IMAGE_DATA_DIR 指向仅当前用户可访问的真实目录。"
-    });
-  }
-  if ((details.mode & 0o077) !== 0) await chmod(directory, 0o700);
 }

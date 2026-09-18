@@ -1,8 +1,8 @@
 # Quick Image Agent Runtime
 
-Quick Image Agent Runtime 是 Quick Image Agent Plugin 使用的本地处理运行时。它负责在用户设备上检查和预处理会话附件、执行确定性估价，并将暂存附件上传到 Quick Image 服务签发的目标。
+Quick Image Agent Runtime 是 Quick Image Agent Plugin 使用的本地处理运行时。它负责在用户设备上检查和预处理会话附件、执行确定性估价，将暂存附件上传到 Quick Image 服务签发的目标，并把任务结果的预览媒体受约束地下载到私有缓存目录供宿主以本地文件投递（仅 HTTPS、拒绝重定向、超时与大小上限、magic bytes 校验；缓存仅按容量阈值从旧到新淘汰）。
 
-同一个包也导出本地处理核心 API。Codex 等 MCP 宿主启动 `quick-image-local-mcp`，OpenClaw 原生适配器直接导入核心 API，从而复用完全相同的媒体处理、估价和上传实现。
+同一个包也导出本地处理核心 API。Codex 等 MCP 宿主启动 `quick-image-local-mcp`，OpenClaw 原生适配器直接导入核心 API，从而复用完全相同的媒体处理、估价、上传和预览下载实现。
 
 本仓库不处理登录、素材归属、最终计价、扣费或任务状态；这些权威业务逻辑保留在 Quick Image 服务端。
 
