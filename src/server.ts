@@ -1,9 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import path from "node:path";
 import { z } from "zod";
 import { HANDLE_CLEANUP_INTERVAL_MS, RUNTIME_VERSION } from "./constants.js";
 import {
   directUploadSchema,
+  downloadedPreviewOutputSchema,
   estimateOutputSchema,
   inspectedOutputSchema,
   lookbookEstimateInputSchema,
@@ -16,6 +18,7 @@ import { toPluginError } from "./errors.js";
 import { estimateGenerationCredits } from "./pricing/estimate-generation-credits.js";
 import { assertSupportedRuntime, resolveDataDirectory } from "./runtime.js";
 import { AttachmentPipeline } from "./services/attachment-pipeline.js";
+import { PreviewDownloadService } from "./services/download-preview-media.js";
 
 async function main(): Promise<void> {
   assertSupportedRuntime();
@@ -143,6 +146,32 @@ async function main(): Promise<void> {
     },
     async ({ staged_handle, direct_upload }) =>
       executeTool(() => attachments.upload(staged_handle, direct_upload))
+  );
+
+  // 预览缓存与附件管线共用本地状态根目录。启动清扫在服务构造后立即尽力执行：
+  // 失败仅记 stderr 日志、不阻断其他本地工具（首次下载前会自动重试并如实报错）；
+  // 容量清理由服务在每次保存后自触发。
+  const previewDownloads = new PreviewDownloadService(path.join(resolveDataDirectory(), "preview-cache"));
+  void previewDownloads.initialize().catch(() => {
+    process.stderr.write(`${JSON.stringify({ code: "PREVIEW_CACHE_CLEANUP_FAILED" })}\n`);
+  });
+  server.registerTool(
+    "download_preview_media",
+    {
+      title: "下载 Quick Image 预览媒体",
+      description: "把任务结果返回的图片预览 display_url 受约束下载到本地私有缓存目录，返回本地绝对路径、magic bytes 检测出的格式和字节数，供宿主以本地文件展示预览。仅接受 HTTPS URL，拒绝重定向，总超时 60 秒，大小上限 50MB，只接受 JPEG/PNG/WebP；同一 URL 命中缓存不重复下载。缓存文件在返回后继续存在，仅在目录超容量时从旧到新淘汰。视频预览不走本工具。",
+      inputSchema: z.object({
+        display_url: z.string().min(1).max(8192).describe("任务结果返回的预览 display_url；仅接受 HTTPS URL")
+      }),
+      outputSchema: downloadedPreviewOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+    },
+    async ({ display_url }) =>
+      executeTool(() => previewDownloads.withCachedPreview(display_url, async (file) => ({
+        file_path: file.filePath,
+        content_type: file.contentType,
+        bytes: file.bytes
+      })))
   );
 
   const cleanupTimer = setInterval(() => {

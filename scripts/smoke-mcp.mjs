@@ -1,4 +1,5 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -13,11 +14,25 @@ const transport = new StdioClientTransport({
   env: { ...process.env, QUICK_IMAGE_DATA_DIR: stateDirectory }
 });
 
+// 预置命中缓存：缓存文件名 = sha256(完整 URL) + 检测出的扩展名；另留一个 tmp
+// 残留，验证启动清扫在服务启动时（而非首次下载前）真实执行。
+const previewUrl = "https://preview.example.com/smoke.png";
+const previewKey = createHash("sha256").update(previewUrl).digest("hex");
+const previewCacheDirectory = path.join(stateDirectory, "upload-bridge", "preview-cache");
+const previewPath = path.join(previewCacheDirectory, `${previewKey}.png`);
+const previewBuffer = await sharp({
+  create: { width: 16, height: 12, channels: 3, background: { r: 90, g: 60, b: 140 } }
+}).png().toBuffer();
+await mkdir(previewCacheDirectory, { recursive: true, mode: 0o700 });
+await writeFile(previewPath, previewBuffer);
+await writeFile(path.join(previewCacheDirectory, "swept-leftover.tmp-smoke"), previewBuffer);
+
 try {
   await client.connect(transport);
   const result = await client.listTools();
   const names = result.tools.map((tool) => tool.name).sort();
   const expected = [
+    "download_preview_media",
     "estimate_lookbook_credits",
     "estimate_pose_credits",
     "estimate_upscale_credits",
@@ -154,6 +169,36 @@ try {
   const missing = await client.callTool({ name: "inspect_attachment", arguments: { path: missingPath } });
   if (!missing.isError || JSON.stringify(missing).includes(missingPath)) {
     throw new Error("inspect_attachment did not redact a local filesystem error");
+  }
+  const insecurePreview = await client.callTool({
+    name: "download_preview_media",
+    arguments: { display_url: "http://media.example.com/preview.jpg" }
+  });
+  if (!insecurePreview.isError || !JSON.stringify(insecurePreview).includes("PREVIEW_URL_REJECTED")) {
+    throw new Error("download_preview_media accepted a non-HTTPS preview URL");
+  }
+  const cachedPreview = await client.callTool({
+    name: "download_preview_media",
+    arguments: { display_url: previewUrl }
+  });
+  if (
+    cachedPreview.isError ||
+    cachedPreview.structuredContent?.file_path !== previewPath ||
+    cachedPreview.structuredContent?.content_type !== "image/png" ||
+    cachedPreview.structuredContent?.bytes !== previewBuffer.length
+  ) {
+    throw new Error(`download_preview_media did not serve the cached preview: ${JSON.stringify(cachedPreview)}`);
+  }
+  if (!previewBuffer.equals(await readFile(previewPath))) {
+    throw new Error("download_preview_media returned a preview file whose content changed on disk");
+  }
+  const leftoverPath = path.join(previewCacheDirectory, "swept-leftover.tmp-smoke");
+  const sweepDeadline = Date.now() + 2000;
+  while ((await stat(leftoverPath).catch(() => null)) !== null) {
+    if (Date.now() > sweepDeadline) {
+      throw new Error("preview cache startup sweep did not remove the seeded tmp leftover");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
   const imagePath = path.join(stateDirectory, "smoke.png");
   await writeFile(imagePath, await sharp({
