@@ -148,8 +148,13 @@ async function main(): Promise<void> {
       executeTool(() => attachments.upload(staged_handle, direct_upload))
   );
 
-  // 预览缓存与附件管线共用本地状态根目录；缓存清理由服务在启动和每次保存后自触发。
+  // 预览缓存与附件管线共用本地状态根目录。启动清扫在服务构造后立即尽力执行：
+  // 失败仅记 stderr 日志、不阻断其他本地工具（首次下载前会自动重试并如实报错）；
+  // 容量清理由服务在每次保存后自触发。
   const previewDownloads = new PreviewDownloadService(path.join(resolveDataDirectory(), "preview-cache"));
+  void previewDownloads.initialize().catch(() => {
+    process.stderr.write(`${JSON.stringify({ code: "PREVIEW_CACHE_CLEANUP_FAILED" })}\n`);
+  });
   server.registerTool(
     "download_preview_media",
     {
