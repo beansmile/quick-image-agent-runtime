@@ -3,7 +3,13 @@ import {
   resetCodexEnvironment,
   setCodexEnvironment
 } from "./codex.js";
-import { normalizeEnvironmentUrls, type EnvironmentStatus } from "./config.js";
+import type { CommandExecutor } from "./command-executor.js";
+import {
+  normalizeEnvironmentUrls,
+  QUICK_IMAGE_PRODUCTION_FRONTEND_URL,
+  QUICK_IMAGE_PRODUCTION_SERVER_URL,
+  type EnvironmentStatus
+} from "./config.js";
 import {
   readOpenClawEnvironmentStatus,
   resetOpenClawEnvironment,
@@ -55,6 +61,58 @@ export async function executeEnvironmentCommand(options: EnvironmentCommandOptio
         : await readOpenClawEnvironmentStatus(openClawOptions));
   }
   return results;
+}
+
+export interface HostProductionCheck {
+  host: "codex" | "openclaw";
+  available: boolean;
+  is_production: boolean | null;
+  source: EnvironmentStatus["source"] | "unavailable";
+}
+
+export interface ProductionEnvironmentReport {
+  hosts: HostProductionCheck[];
+}
+
+export interface ProductionCheckOptions {
+  runtimeVersion: string;
+  codexBin?: string;
+  openClawBin?: string;
+  executor?: CommandExecutor;
+}
+
+// 供本地 MCP 工具使用的脱敏环境检查：只回答“是否正式环境”，任何情况下都不返回
+// 服务器或前端地址，避免非正式环境地址进入 AI 会话上下文。
+export async function checkEnvironmentProduction(options: ProductionCheckOptions): Promise<ProductionEnvironmentReport> {
+  const hosts: HostProductionCheck[] = [];
+  const attempts: Array<"codex" | "openclaw"> = ["codex", "openclaw"];
+  for (const host of attempts) {
+    try {
+      const status = host === "codex"
+        ? await readCodexEnvironmentStatus({
+            runtimeVersion: options.runtimeVersion,
+            ...(options.codexBin ? { codexBin: options.codexBin } : {}),
+            ...(options.executor ? { executor: options.executor } : {})
+          })
+        : await readOpenClawEnvironmentStatus({
+            runtimeVersion: options.runtimeVersion,
+            ...(options.openClawBin ? { openClawBin: options.openClawBin } : {}),
+            ...(options.executor ? { executor: options.executor } : {})
+          });
+      hosts.push({
+        host,
+        available: true,
+        is_production: status.configured
+          ? status.serverUrl === QUICK_IMAGE_PRODUCTION_SERVER_URL &&
+            status.frontendUrl === QUICK_IMAGE_PRODUCTION_FRONTEND_URL
+          : null,
+        source: status.source
+      });
+    } catch {
+      hosts.push({ host, available: false, is_production: null, source: "unavailable" });
+    }
+  }
+  return { hosts };
 }
 
 export function formatEnvironmentResult(action: EnvironmentAction, statuses: EnvironmentStatus[]): string {

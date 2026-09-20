@@ -48,7 +48,9 @@ quick-image env status --host <codex|openclaw|all>
 quick-image env reset --host <codex|openclaw|all>
 ```
 
-完整执行时，上述两条命令同样需要加上 `npx --yes --prefer-online --package <Runtime Release tgz>` 前缀。Codex 会通过 `codex plugin list --json` 自动定位 Quick Image Plugin 的 Marketplace 工作副本，并根据返回的 Marketplace、Plugin 与版本信息定位 `plugins/cache` 中的实际安装缓存；两处的 Codex MCP 清单和 `mcp.json` 会同步更新，只修改 `quick-image` 服务并保留其他服务，任一写入失败都会回滚。OpenClaw 通过宿主的 `mcp set` 和 `mcp reload` 生效。切换地址不会读取、迁移或复用 OAuth 凭据，完成后必须按命令输出重新登录对应的 `quick-image` MCP。Codex 还需要新建任务加载新配置。
+完整执行时，上述两条命令同样需要加上 `npx --yes --prefer-online --package <Runtime Release tgz>` 前缀。Codex 宿主通过 `~/.codex/config.toml` 生效：命令会在文件末尾追加（或替换）带 `# BEGIN/END quick-image managed MCP environment` 标记的 `mcp_servers.quick-image` 管理区块，该区块优先于插件清单中的默认地址，且不受 Codex 重建插件缓存影响。写入前先把原文件备份为同目录的 `config.toml.quick-image-backup`；写入采用临时文件加原子重命名，随后用 `codex mcp list/get` 验证 Codex 能解析并加载新配置，验证失败自动恢复原文。区块外的任何内容不会被改动，接缝处的空行按原样保留（仅删除发生在文件末尾时，尾部空行会收敛为单个换行）。若存在他人手写的同名 `mcp_servers.quick-image` 配置：不带 Quick Image 私有请求头时，命令会拒绝写入并提示先手工处理；同时带有 `X-Quick-Image-Plugin-Version` 与 `X-Quick-Image-Frontend-URL` 两个私有请求头时，会被认定为 Quick Image 写入的配置或标记被破坏的残留，`env set` 将其替换为管理区块、`env reset` 将其清除，被替换的原文均可从备份文件找回。`env reset` 删除该管理区块，Codex 自动回落到插件清单的正式默认地址。OpenClaw 通过宿主的 `mcp set` 和 `mcp reload` 生效。切换地址不会读取、迁移或复用 OAuth 凭据，完成后必须按命令输出重新登录对应的 `quick-image` MCP。Codex 还需要新建任务加载新配置。
+
+本地 MCP 另提供 `check_environment` 工具：检查 Codex 与 OpenClaw 当前生效环境是否为正式环境（production），只返回是否正式、配置来源与宿主是否可检查，不返回任何服务器或前端地址，可安全用于 AI 会话中排查环境问题。
 
 同一个 Runtime Release tgz 还提供安装诊断命令：
 

@@ -32,6 +32,7 @@ try {
   const result = await client.listTools();
   const names = result.tools.map((tool) => tool.name).sort();
   const expected = [
+    "check_environment",
     "download_preview_media",
     "estimate_lookbook_credits",
     "estimate_pose_credits",
