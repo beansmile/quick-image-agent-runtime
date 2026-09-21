@@ -23,6 +23,7 @@ jobs:
         with:
           node-version: 20
           cache: pnpm
+          registry-url: https://registry.npmjs.org/
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -34,6 +35,16 @@ jobs:
 
       - name: Validate release
         run: pnpm check
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            npm publish --tag next --access public
+          else
+            npm publish --access public
+          fi
 
       - name: Build release archive
         run: |
