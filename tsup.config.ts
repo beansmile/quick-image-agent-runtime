@@ -2,7 +2,6 @@ import { defineConfig } from "tsup";
 
 export default defineConfig({
   entry: {
-    "cli/doctor": "src/cli/doctor.ts",
     "cli/quick-image": "src/cli/quick-image.ts",
     index: "src/index.ts",
     server: "src/server.ts"

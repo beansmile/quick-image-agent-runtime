@@ -50,16 +50,6 @@ quick-image env reset --host <codex|openclaw|workbuddy>
 
 完整执行时，上述两条命令同样需要加上 `npx --yes --prefer-online --package quick-image-agent-runtime@latest` 前缀。命令只改写 quick-image 自身的 MCP 配置：写入前自动备份、写入后校验、失败自动恢复，不影响宿主的其他配置。切换地址不会迁移 OAuth 凭据，完成后需重新授权 quick-image MCP：Codex 执行 `codex mcp login quick-image` 并新建任务加载配置；WorkBuddy 完全退出并重新打开后重新授权；OpenClaw 执行 `openclaw mcp login quick-image`，配置即时生效。WorkBuddy 主目录不在默认位置时可用 `WORKBUDDY_HOME` 环境变量指定；同版本号重装 WorkBuddy 插件不会还原配置，恢复正式环境需执行 `env reset`。
 
-同一个 Runtime 包还提供安装诊断命令：
-
-```bash
-npx --yes --prefer-online \
-  --package quick-image-agent-runtime@latest \
-  quick-image-doctor --host <codex|openclaw>
-```
-
-Doctor 检查运行平台、媒体依赖、私有状态目录和上传策略；OpenClaw 还会检查 Quick Image 原生工具是否被当前工具策略允许。诊断只返回脱敏状态，不修改宿主配置，也不读取 OAuth 凭据。
-
 ## 本地开发
 
 要求 Node.js 20 或更高版本以及 pnpm 10：

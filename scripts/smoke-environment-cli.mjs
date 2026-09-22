@@ -231,18 +231,7 @@ try {
     throw new Error("WorkBuddy environment reset CLI did not restore the production MCP configuration");
   }
 
-  const doctorResult = spawnSync(process.execPath, [
-    path.join(process.cwd(), "dist", "cli", "doctor.js"),
-    "--host",
-    "codex"
-  ], {
-    encoding: "utf8",
-    env: { ...process.env, QUICK_IMAGE_DATA_DIR: root }
-  });
-  if (doctorResult.status !== 0 || JSON.parse(doctorResult.stdout).ok !== true) {
-    throw new Error(`Doctor CLI failed: ${(doctorResult.stderr || doctorResult.stdout).trim()}`);
-  }
-  process.stdout.write("Environment and Doctor CLI smoke tests passed for Codex, OpenClaw, and WorkBuddy.\n");
+  process.stdout.write("Environment CLI smoke tests passed for Codex, OpenClaw, and WorkBuddy.\n");
 } finally {
   await rm(root, { recursive: true, force: true });
 }

@@ -15,7 +15,8 @@ import {
 // 的 mcpServers 字段指向的文件，当前为 ./.mcp.json）从插件安装目录直接加载为
 // custom-mcp 配置。因此环境切换通过改写插件安装目录内的该清单文件实现：
 // 只更新 mcpServers.quick-image 的 url 与 X-Quick-Image-Frontend-URL 两个头，
-// 其余键逐字节保持不变；写入前备份，写入后回读校验，失败自动恢复原文。
+// 其余配置语义保持不变，并按原文还原 BOM、缩进、行尾与结尾换行；写入前备份，
+// 写入后回读校验，失败自动恢复原文，多安装时先整体规划再统一写入。
 // 插件缓存以 installed_plugins.json 为权威注册表，孤儿目录（带 .orphaned_at）
 // 不会出现在其中，避免误改已废弃的安装。
 const WORKBUDDY_MANIFEST_CANDIDATES = [".workbuddy-plugin/plugin.json", ".codebuddy-plugin/plugin.json"] as const;
@@ -32,13 +33,38 @@ interface WorkBuddyInstall {
   mcpPath: string;
 }
 
+interface WorkBuddyMcpUpdatePlan {
+  mcpPath: string;
+  originalText: string;
+  original: Record<string, unknown>;
+  updatedText: string;
+  mode: number;
+}
+
 export async function setWorkBuddyEnvironment(urls: EnvironmentUrls, options: WorkBuddyOptions): Promise<EnvironmentStatus> {
   const installs = await resolveWorkBuddyInstalls(resolveWorkBuddyHome(options.workbuddyHome));
   if (installs.length === 0) {
     throw new Error("在 WorkBuddy 中找不到 quick-image 插件安装，请先在 WorkBuddy 中安装 Quick Image Plugin");
   }
+  // 多个安装（不同 scope）先全部完成解析与改写计算，再统一写入：任何一个安装
+  // 无法解析时不会动任何文件；写入阶段中途失败时把已写入的安装回滚为原文，
+  // 避免宿主按不同 scope 加载到混合环境。
+  const plans = [];
   for (const install of installs) {
-    await updateWorkBuddyMcpFile(install.mcpPath, urls);
+    plans.push(await planWorkBuddyMcpUpdate(install.mcpPath, urls));
+  }
+  const committed: WorkBuddyMcpUpdatePlan[] = [];
+  try {
+    for (const plan of plans) {
+      await commitWorkBuddyMcpUpdate(plan, urls);
+      committed.push(plan);
+    }
+  } catch (error) {
+    // 回滚失败时保留各安装的备份文件供人工恢复，原始错误仍然如实上抛。
+    for (const plan of committed) {
+      await writeAtomic(plan.mcpPath, plan.originalText, plan.mode).catch(() => undefined);
+    }
+    throw error;
   }
   const status = await readWorkBuddyEnvironmentStatus(options);
   if (!status.configured || status.serverUrl !== urls.serverUrl || status.frontendUrl !== urls.frontendUrl) {
@@ -55,7 +81,14 @@ export async function resetWorkBuddyEnvironment(options: WorkBuddyOptions): Prom
 }
 
 export async function readWorkBuddyEnvironmentStatus(options: WorkBuddyOptions): Promise<EnvironmentStatus> {
-  const installs = await resolveWorkBuddyInstalls(resolveWorkBuddyHome(options.workbuddyHome));
+  // 注册表或插件清单损坏、布局异常时按未配置上报而不是让 status 整体失败，
+  // 与下方对 .mcp.json 损坏的处理一致；set/reset 仍会对这些问题显式报错。
+  let installs: WorkBuddyInstall[];
+  try {
+    installs = await resolveWorkBuddyInstalls(resolveWorkBuddyHome(options.workbuddyHome));
+  } catch {
+    return { host: "workbuddy", configured: false, source: "missing" };
+  }
   // 多个安装（不同 scope）同时存在时取第一个可读出 quick-image 配置的文件；
   // set/reset 会同步更新全部安装，正常情况下不会出现不一致。
   for (const install of installs) {
@@ -111,10 +144,24 @@ export function applyWorkBuddyMcpUrls(
 
 export function serializeWorkBuddyManifestText(value: Record<string, unknown>, originalText: string): string {
   // Windows 工具写 JSON 可能带 UTF-8 BOM 且 JSON.parse 无法直接解析；
-  // 序列化时按原文还原 BOM 与结尾换行，避免格式语义被意外改写。
+  // 序列化时按原文还原 BOM、缩进、行尾与结尾换行，尽量少改动无关字节。
   const byteOrderMark = originalText.charCodeAt(0) === 0xfeff ? "\uFEFF" : "";
-  const trailingNewline = originalText.endsWith("\n") ? "\n" : "";
-  return `${byteOrderMark}${JSON.stringify(value, null, 2)}${trailingNewline}`;
+  const lineEnding = originalText.includes("\r\n") ? "\r\n" : "\n";
+  const serialized = serializeWithOriginalWhitespace(value, originalText);
+  const body = lineEnding === "\r\n" ? serialized.replace(/\n/g, "\r\n") : serialized;
+  const trailingNewline = originalText.endsWith("\n") ? lineEnding : "";
+  return `${byteOrderMark}${body}${trailingNewline}`;
+}
+
+// JSON.stringify 的产物不含裸换行，逐个替换 \n 为 \r\n 不会破坏字符串内容。
+function serializeWithOriginalWhitespace(value: Record<string, unknown>, originalText: string): string {
+  const text = stripByteOrderMark(originalText);
+  const firstLineBreak = text.indexOf("\n");
+  // 原文没有换行，或唯一换行是结尾换行，说明是单行压缩格式，保持压缩。
+  if (firstLineBreak === -1 || firstLineBreak === text.length - 1) return JSON.stringify(value);
+  const indent = /^[ \t]+/.exec(text.slice(firstLineBreak + 1))?.[0];
+  if (!indent) return JSON.stringify(value, null, 2);
+  return JSON.stringify(value, null, indent.slice(0, 10));
 }
 
 export function verifyWorkBuddyManifest(
@@ -227,7 +274,7 @@ async function readWorkBuddyMcpUrls(mcpPath: string): Promise<EnvironmentUrls | 
   return { serverUrl: entry.url, frontendUrl };
 }
 
-async function updateWorkBuddyMcpFile(mcpPath: string, urls: EnvironmentUrls): Promise<void> {
+async function planWorkBuddyMcpUpdate(mcpPath: string, urls: EnvironmentUrls): Promise<WorkBuddyMcpUpdatePlan> {
   let details: Stats;
   try {
     details = await lstat(mcpPath);
@@ -242,15 +289,25 @@ async function updateWorkBuddyMcpFile(mcpPath: string, urls: EnvironmentUrls): P
   const original = parseWorkBuddyManifestText(originalText, mcpPath);
   const updated = applyWorkBuddyMcpUrls(original, urls);
   const { mode } = await stat(mcpPath);
-  if (originalText !== "") {
-    await writeAtomic(`${mcpPath}${WORKBUDDY_BACKUP_SUFFIX}`, originalText, mode);
+  return {
+    mcpPath,
+    originalText,
+    original,
+    updatedText: serializeWorkBuddyManifestText(updated, originalText),
+    mode
+  };
+}
+
+async function commitWorkBuddyMcpUpdate(plan: WorkBuddyMcpUpdatePlan, urls: EnvironmentUrls): Promise<void> {
+  if (plan.originalText !== "") {
+    await writeAtomic(`${plan.mcpPath}${WORKBUDDY_BACKUP_SUFFIX}`, plan.originalText, plan.mode);
   }
-  await writeAtomic(mcpPath, serializeWorkBuddyManifestText(updated, originalText), mode);
+  await writeAtomic(plan.mcpPath, plan.updatedText, plan.mode);
   try {
-    const rewritten = parseWorkBuddyManifestText(await readFile(mcpPath, "utf8"), mcpPath);
-    verifyWorkBuddyManifest(original, rewritten, urls);
+    const rewritten = parseWorkBuddyManifestText(await readFile(plan.mcpPath, "utf8"), plan.mcpPath);
+    verifyWorkBuddyManifest(plan.original, rewritten, urls);
   } catch (error) {
-    await writeAtomic(mcpPath, originalText, mode);
+    await writeAtomic(plan.mcpPath, plan.originalText, plan.mode);
     throw error;
   }
 }

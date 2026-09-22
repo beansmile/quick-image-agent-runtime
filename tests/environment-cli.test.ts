@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -475,25 +475,68 @@ describe("WorkBuddy environment adapter", () => {
       .rejects.toThrow("超出插件目录");
   });
 
-  it("leaves the manifest untouched when it lacks the quick-image entry or is broken", async () => {
+  it("leaves every install untouched when a later install cannot be parsed", async () => {
     const directory = await temporaryDirectory();
     const workBuddyHome = path.join(directory, ".workbuddy");
+    const fixture = await writeWorkBuddyFixture(workBuddyHome, {});
+    await appendWorkBuddyInstall(workBuddyHome, "broken", "{ not json");
 
+    await expect(setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome }))
+      .rejects.toThrow("不是有效 JSON");
+    await expect(readFile(fixture.mcpPath, "utf8")).resolves.toBe(fixture.originalText);
+  });
+
+  it("restores already-written installs when a later install fails to write", async () => {
+    // root 用户不受目录只读位约束；Windows 目录只读属性不阻止在其中创建与
+    // 重命名文件。两者都无法触发写入失败，跳过该路径。
+    if (process.platform === "win32" || process.getuid?.() === 0) return;
+    const directory = await temporaryDirectory();
+    const workBuddyHome = path.join(directory, ".workbuddy");
+    const fixture = await writeWorkBuddyFixture(workBuddyHome, {});
+    const lockedRoot = await appendWorkBuddyInstall(workBuddyHome, "locked");
+    // 只读目录能让解析与备份读取照常进行，但写入第二个安装时失败，
+    // 以此触发“第一个安装已写入”的回滚路径。
+    await chmod(lockedRoot, 0o500);
+    try {
+      await expect(setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome })).rejects.toThrow();
+      await expect(readFile(fixture.mcpPath, "utf8")).resolves.toBe(fixture.originalText);
+    } finally {
+      await chmod(lockedRoot, 0o700);
+    }
+  });
+
+  it("leaves the manifest untouched when it lacks the quick-image entry", async () => {
+    const directory = await temporaryDirectory();
+    const workBuddyHome = path.join(directory, ".workbuddy");
     const missingEntry = await writeWorkBuddyFixture(workBuddyHome, {
-      registryKey: "quick-image@quick-image",
       mcpContent: JSON.stringify({ mcpServers: { "other-server": { type: "stdio", command: "npx" } } })
     });
+
     await expect(setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome }))
       .rejects.toThrow("缺少 quick-image 配置");
     await expect(readFile(missingEntry.mcpPath, "utf8")).resolves.toBe(missingEntry.originalText);
+  });
 
-    const broken = await writeWorkBuddyFixture(workBuddyHome, {
-      installPathSuffix: "broken",
-      mcpContent: "{ not json"
+  it("reports missing instead of failing when the registry or plugin manifest is unreadable", async () => {
+    const directory = await temporaryDirectory();
+    const workBuddyHome = path.join(directory, ".workbuddy");
+    await writeWorkBuddyFixture(workBuddyHome, { manifestContent: "{ not json" });
+
+    await expect(readWorkBuddyEnvironmentStatus({ workbuddyHome: workBuddyHome })).resolves.toEqual({
+      host: "workbuddy",
+      configured: false,
+      source: "missing"
     });
     await expect(setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome }))
-      .rejects.toThrow("不是有效 JSON");
-    await expect(readFile(broken.mcpPath, "utf8")).resolves.toBe(broken.originalText);
+      .rejects.toThrow("文件不是有效的 JSON 对象");
+
+    const registryPath = path.join(workBuddyHome, "plugins", "installed_plugins.json");
+    await writeFile(registryPath, "{ not json");
+    await expect(readWorkBuddyEnvironmentStatus({ workbuddyHome: workBuddyHome })).resolves.toEqual({
+      host: "workbuddy",
+      configured: false,
+      source: "missing"
+    });
   });
 
   it("preserves the byte order mark and trailing newline style of the original file", async () => {
@@ -510,6 +553,20 @@ describe("WorkBuddy environment adapter", () => {
     expect(rewritten.endsWith("\n")).toBe(false);
     // BOM 由读取方剥离（parseWorkBuddyManifestText），剥离后必须仍是有效 JSON。
     expect(() => JSON.parse(rewritten.slice(1))).not.toThrow();
+  });
+
+  it("preserves CRLF line endings and indentation of the original file", async () => {
+    const directory = await temporaryDirectory();
+    const workBuddyHome = path.join(directory, ".workbuddy");
+    const crlfText = `${JSON.stringify(defaultWorkBuddyMcpValue(), null, 4).replace(/\n/g, "\r\n")}\r\n`;
+    const fixture = await writeWorkBuddyFixture(workBuddyHome, { mcpContent: crlfText, trailingNewline: false });
+
+    await setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome });
+    const rewritten = await readFile(fixture.mcpPath, "utf8");
+    const parsed = JSON.parse(rewritten);
+    expect(parsed.mcpServers["quick-image"].url).toBe(stagingUrls.serverUrl);
+    // 行尾全部保持 CRLF，缩进保持 4 空格：与重新格式化的语义等价文本完全一致。
+    expect(rewritten).toBe(`${JSON.stringify(parsed, null, 4).replace(/\n/g, "\r\n")}\r\n`);
   });
 
   it("creates a headers container when the entry ships without one", () => {
@@ -554,8 +611,17 @@ describe("WorkBuddy environment adapter", () => {
 
   it("serializes with a byte order mark only when the original had one", () => {
     const value = { mcpServers: {} };
-    expect(serializeWorkBuddyManifestText(value, "\uFEFF{}\n")).toBe(`\uFEFF${JSON.stringify(value, null, 2)}\n`);
-    expect(serializeWorkBuddyManifestText(value, "{}")).toBe(JSON.stringify(value, null, 2));
+    expect(serializeWorkBuddyManifestText(value, "\uFEFF{}\n")).toBe(`\uFEFF${JSON.stringify(value)}\n`);
+    expect(serializeWorkBuddyManifestText(value, "{}")).toBe(JSON.stringify(value));
+  });
+
+  it("preserves CRLF line endings, indentation, and minified formatting", () => {
+    const value = { mcpServers: {} };
+    expect(serializeWorkBuddyManifestText(value, '{\r\n    "mcpServers": {}\r\n}\r\n'))
+      .toBe('{\r\n    "mcpServers": {}\r\n}\r\n');
+    expect(serializeWorkBuddyManifestText(value, '{\n\t"mcpServers": {}\n}\n'))
+      .toBe(`{\n\t"mcpServers": {}\n}\n`);
+    expect(serializeWorkBuddyManifestText(value, '{"mcpServers":{}}\n')).toBe('{"mcpServers":{}}\n');
   });
 });
 
@@ -596,6 +662,7 @@ interface WorkBuddyFixtureOptions {
   manifest?: ".workbuddy-plugin" | ".codebuddy-plugin";
   mcpServers?: string;
   mcpContent?: string;
+  manifestContent?: string;
   registryKey?: string;
   installPathSuffix?: string;
   byteOrderMark?: boolean;
@@ -608,37 +675,16 @@ async function writeWorkBuddyFixture(home: string, options: WorkBuddyFixtureOpti
   const registryKey = options.registryKey ?? "quick-image@quick-image";
   const root = path.join(home, "plugins", "cache", "quick-image", "quick-image", options.installPathSuffix ?? "0.1.8");
   await mkdir(path.join(root, manifestDir), { recursive: true });
-  await writeFile(path.join(root, manifestDir, "plugin.json"), JSON.stringify({
+  await writeFile(path.join(root, manifestDir, "plugin.json"), options.manifestContent ?? JSON.stringify({
     name: "quick-image",
     version: "0.1.8",
     skills: "./skills/",
     mcpServers: options.mcpServers ?? `./${mcpFileName}`
   }));
   const mcpPath = path.join(root, mcpFileName);
-  const mcpValue = options.mcpContent === undefined
-    ? {
-        mcpServers: {
-          "quick-image": {
-            type: "http",
-            url: "https://quickimage.ai/mcp",
-            headers: {
-              "X-Quick-Image-Plugin-Version": "0.1.8",
-              "X-Quick-Image-Frontend-URL": "https://quickimage.ai"
-            },
-            http_headers: {
-              "X-Quick-Image-Plugin-Version": "0.1.8",
-              "X-Quick-Image-Frontend-URL": "https://quickimage.ai"
-            }
-          },
-          "quick-image-local": {
-            type: "stdio",
-            command: "npx",
-            args: ["--yes", "--package", "quick-image-agent-runtime@0.2.8", "quick-image-local-mcp"]
-          }
-        }
-      }
+  const serialized = options.mcpContent === undefined
+    ? JSON.stringify(defaultWorkBuddyMcpValue(), null, 2)
     : options.mcpContent;
-  const serialized = typeof mcpValue === "string" ? mcpValue : JSON.stringify(mcpValue, null, 2);
   const originalText = `${options.byteOrderMark ? "\uFEFF" : ""}${serialized}${options.trailingNewline === false ? "" : "\n"}`;
   await writeFile(mcpPath, originalText);
   await mkdir(path.join(home, "plugins"), { recursive: true });
@@ -662,6 +708,53 @@ async function writeWorkBuddyFixture(home: string, options: WorkBuddyFixtureOpti
     }
   }));
   return { mcpPath, originalText };
+}
+
+// 追加第二个（不同 scope 的）quick-image 安装并登记进现有注册表，
+// 用于覆盖多安装的写入与回滚路径。
+async function appendWorkBuddyInstall(home: string, installPathSuffix: string, mcpContent?: string): Promise<string> {
+  const root = path.join(home, "plugins", "cache", "quick-image", "quick-image", installPathSuffix);
+  await mkdir(path.join(root, ".workbuddy-plugin"), { recursive: true });
+  await writeFile(path.join(root, ".workbuddy-plugin", "plugin.json"), JSON.stringify({
+    name: "quick-image",
+    version: "0.1.8",
+    skills: "./skills/",
+    mcpServers: "./.mcp.json"
+  }));
+  await writeFile(path.join(root, ".mcp.json"), mcpContent ?? `${JSON.stringify(defaultWorkBuddyMcpValue(), null, 2)}\n`);
+  const registryPath = path.join(home, "plugins", "installed_plugins.json");
+  const registry = JSON.parse(await readFile(registryPath, "utf8")) as {
+    plugins: Record<string, Array<{ scope: string; installPath: string }> | undefined>;
+  };
+  const quickImageEntries = registry.plugins["quick-image@quick-image"];
+  if (!quickImageEntries) throw new Error("fixture registry is missing the quick-image entry");
+  quickImageEntries.push({ scope: "project", installPath: root });
+  await writeFile(registryPath, JSON.stringify(registry));
+  return root;
+}
+
+function defaultWorkBuddyMcpValue() {
+  return {
+    mcpServers: {
+      "quick-image": {
+        type: "http",
+        url: "https://quickimage.ai/mcp",
+        headers: {
+          "X-Quick-Image-Plugin-Version": "0.1.8",
+          "X-Quick-Image-Frontend-URL": "https://quickimage.ai"
+        },
+        http_headers: {
+          "X-Quick-Image-Plugin-Version": "0.1.8",
+          "X-Quick-Image-Frontend-URL": "https://quickimage.ai"
+        }
+      },
+      "quick-image-local": {
+        type: "stdio",
+        command: "npx",
+        args: ["--yes", "--package", "quick-image-agent-runtime@0.2.8", "quick-image-local-mcp"]
+      }
+    }
+  };
 }
 
 async function writeContaminatedPluginFixture(root: string): Promise<void> {
