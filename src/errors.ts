@@ -30,6 +30,6 @@ export function toPluginError(error: unknown): PluginError {
   if (error instanceof PluginError) return error;
   return new PluginError("LOCAL_TOOL_ERROR", "Quick Image 本地工具处理失败。", {
     retryable: false,
-    suggested_action: "运行 quick-image-doctor，并在脱敏后提供错误码。"
+    suggested_action: "请重试；若持续失败，请在脱敏后提供错误码反馈。"
   });
 }

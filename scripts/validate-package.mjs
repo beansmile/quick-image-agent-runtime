@@ -5,15 +5,14 @@ const root = process.cwd();
 const packageJson = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
 const errors = [];
 
-if (packageJson.private !== true) errors.push("package.json: package must remain private");
 if (packageJson.bin?.["quick-image-local-mcp"] !== "./dist/server.js") {
   errors.push("package.json: quick-image-local-mcp must point to ./dist/server.js");
 }
 if (packageJson.bin?.["quick-image"] !== "./dist/cli/quick-image.js") {
   errors.push("package.json: quick-image must point to ./dist/cli/quick-image.js");
 }
-if (packageJson.bin?.["quick-image-doctor"] !== "./dist/cli/doctor.js") {
-  errors.push("package.json: quick-image-doctor must point to ./dist/cli/doctor.js");
+if (packageJson.bin?.["quick-image-doctor"]) {
+  errors.push("package.json: quick-image-doctor bin has been removed and must not be declared");
 }
 if (packageJson.exports?.["."]?.import !== "./dist/index.js") {
   errors.push("package.json: package root must export ./dist/index.js");
@@ -23,7 +22,6 @@ if (packageJson.repository?.url !== "git+https://github.com/beansmile/quick-imag
 }
 
 for (const required of [
-  "dist/cli/doctor.js",
   "dist/cli/quick-image.js",
   "dist/index.js",
   "dist/index.d.ts",

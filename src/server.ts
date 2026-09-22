@@ -6,7 +6,6 @@ import { HANDLE_CLEANUP_INTERVAL_MS, RUNTIME_VERSION } from "./constants.js";
 import {
   directUploadSchema,
   downloadedPreviewOutputSchema,
-  environmentCheckOutputSchema,
   estimateOutputSchema,
   inspectedOutputSchema,
   lookbookEstimateInputSchema,
@@ -18,7 +17,6 @@ import {
 import { toPluginError } from "./errors.js";
 import { estimateGenerationCredits } from "./pricing/estimate-generation-credits.js";
 import { assertSupportedRuntime, resolveDataDirectory } from "./runtime.js";
-import { checkEnvironmentProduction } from "./environment/service.js";
 import { AttachmentPipeline } from "./services/attachment-pipeline.js";
 import { PreviewDownloadService } from "./services/download-preview-media.js";
 
@@ -174,20 +172,6 @@ async function main(): Promise<void> {
         content_type: file.contentType,
         bytes: file.bytes
       })))
-  );
-
-  // 环境自检：只回答是否正式环境，不返回任何地址（包括非正式环境地址），
-  // 防止内部环境信息通过 AI 会话上下文泄露。
-  server.registerTool(
-    "check_environment",
-    {
-      title: "检查 Quick Image 是否正式环境",
-      description: "检查本机 Codex 与 OpenClaw 宿主当前生效的 Quick Image MCP 环境是否为正式环境（production）。仅返回各宿主是否正式环境、配置来源与是否可检查；不返回任何服务器或前端地址。用户怀疑连到了非正式环境、或任务行为异常需要排除环境因素时使用。",
-      inputSchema: z.object({}),
-      outputSchema: environmentCheckOutputSchema,
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
-    },
-    async () => executeTool(() => checkEnvironmentProduction({ runtimeVersion: RUNTIME_VERSION }))
   );
 
   const cleanupTimer = setInterval(() => {

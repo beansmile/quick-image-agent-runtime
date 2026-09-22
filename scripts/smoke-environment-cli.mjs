@@ -145,18 +145,93 @@ try {
     throw new Error("environment CLI did not update the OpenClaw MCP configuration");
   }
 
-  const doctorResult = spawnSync(process.execPath, [
-    path.join(process.cwd(), "dist", "cli", "doctor.js"),
+  const workBuddyHome = path.join(root, ".workbuddy");
+  const workBuddyRoot = path.join(workBuddyHome, "plugins", "cache", "quick-image", "quick-image", "0.1.8");
+  const workBuddyMcpPath = path.join(workBuddyRoot, ".mcp.json");
+  const originalWorkBuddyMcp = `${JSON.stringify({
+    mcpServers: {
+      "quick-image": {
+        type: "http",
+        url: "https://quickimage.ai/mcp",
+        headers: {
+          "X-Quick-Image-Plugin-Version": "0.1.8",
+          "X-Quick-Image-Frontend-URL": "https://quickimage.ai"
+        },
+        http_headers: {
+          "X-Quick-Image-Plugin-Version": "0.1.8",
+          "X-Quick-Image-Frontend-URL": "https://quickimage.ai"
+        }
+      },
+      "quick-image-local": {
+        type: "stdio",
+        command: "npx",
+        args: ["--yes", "--package", "quick-image-agent-runtime@0.2.8", "quick-image-local-mcp"]
+      }
+    }
+  }, null, 2)}\n`;
+  await mkdir(path.join(workBuddyRoot, ".workbuddy-plugin"), { recursive: true });
+  await writeFile(path.join(workBuddyRoot, ".workbuddy-plugin", "plugin.json"), JSON.stringify({
+    name: "quick-image",
+    version: "0.1.8",
+    skills: "./skills/",
+    mcpServers: "./.mcp.json"
+  }));
+  await writeFile(workBuddyMcpPath, originalWorkBuddyMcp);
+  await writeFile(path.join(workBuddyHome, "plugins", "installed_plugins.json"), JSON.stringify({
+    version: 2,
+    plugins: {
+      "quick-image@quick-image": [{
+        scope: "user",
+        installPath: workBuddyRoot,
+        version: "0.1.8",
+        installedAt: "2026-09-21T15:19:54.090Z",
+        lastUpdated: "2026-09-21T15:19:54.090Z"
+      }]
+    }
+  }));
+
+  const workBuddySet = spawnSync(process.execPath, [
+    path.join(process.cwd(), "dist", "cli", "quick-image.js"),
+    "env",
+    "set",
     "--host",
-    "codex"
-  ], {
-    encoding: "utf8",
-    env: { ...process.env, QUICK_IMAGE_DATA_DIR: root }
-  });
-  if (doctorResult.status !== 0 || JSON.parse(doctorResult.stdout).ok !== true) {
-    throw new Error(`Doctor CLI failed: ${(doctorResult.stderr || doctorResult.stdout).trim()}`);
+    "workbuddy",
+    "--server-url",
+    "https://staging-api.example.com/mcp",
+    "--frontend-url",
+    "https://staging.example.com"
+  ], { encoding: "utf8", env: { ...process.env, WORKBUDDY_HOME: workBuddyHome } });
+  if (workBuddySet.status !== 0) {
+    throw new Error(`WorkBuddy environment CLI failed: ${(workBuddySet.stderr || workBuddySet.stdout).trim()}`);
   }
-  process.stdout.write("Environment and Doctor CLI smoke tests passed for Codex and OpenClaw.\n");
+  const workBuddyUpdated = JSON.parse(await readFile(workBuddyMcpPath, "utf8"));
+  if (workBuddyUpdated.mcpServers["quick-image"].url !== "https://staging-api.example.com/mcp" ||
+      workBuddyUpdated.mcpServers["quick-image"].headers["X-Quick-Image-Frontend-URL"] !== "https://staging.example.com" ||
+      JSON.stringify(workBuddyUpdated.mcpServers["quick-image-local"]) !==
+        JSON.stringify(JSON.parse(originalWorkBuddyMcp).mcpServers["quick-image-local"])) {
+    throw new Error("environment CLI did not update only the quick-image entry in the WorkBuddy MCP manifest");
+  }
+  if (await readFile(`${workBuddyMcpPath}.quick-image-backup`, "utf8").then((content) => content !== originalWorkBuddyMcp).catch(() => true)) {
+    throw new Error("environment CLI did not back up the WorkBuddy MCP manifest before writing");
+  }
+
+  const workBuddyReset = spawnSync(process.execPath, [
+    path.join(process.cwd(), "dist", "cli", "quick-image.js"),
+    "env",
+    "reset",
+    "--host",
+    "workbuddy"
+  ], { encoding: "utf8", env: { ...process.env, WORKBUDDY_HOME: workBuddyHome } });
+  if (workBuddyReset.status !== 0) {
+    throw new Error(`WorkBuddy reset CLI failed: ${(workBuddyReset.stderr || workBuddyReset.stdout).trim()}`);
+  }
+  const workBuddyResetConfig = JSON.parse(await readFile(workBuddyMcpPath, "utf8"));
+  if (workBuddyResetConfig.mcpServers["quick-image"].url !== "https://quickimage.ai/mcp" ||
+      workBuddyResetConfig.mcpServers["quick-image"].headers["X-Quick-Image-Frontend-URL"] !== "https://quickimage.ai") {
+    throw new Error("WorkBuddy environment reset CLI did not restore the production MCP configuration");
+  }
+
+  process.stdout.write("Environment CLI smoke tests passed for Codex, OpenClaw, and WorkBuddy.\n");
 } finally {
   await rm(root, { recursive: true, force: true });
 }
