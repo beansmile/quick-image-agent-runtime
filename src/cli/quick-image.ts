@@ -48,8 +48,8 @@ export async function runQuickImageCli(argv: string[]): Promise<string> {
 }
 
 function parseHost(value: string | undefined): EnvironmentHost {
-  if (value === "codex" || value === "openclaw" || value === "all") return value;
-  throw new Error("--host 必须是 codex、openclaw 或 all");
+  if (value === "codex" || value === "openclaw" || value === "workbuddy") return value;
+  throw new Error("--host 必须是 codex、openclaw 或 workbuddy");
 }
 
 function isEnvironmentAction(value: string | undefined): value is EnvironmentAction {
@@ -59,9 +59,9 @@ function isEnvironmentAction(value: string | undefined): value is EnvironmentAct
 function usageError(): Error {
   return new Error([
     "用法：",
-    "  quick-image env set --host <codex|openclaw|all> --server-url <URL> --frontend-url <URL>",
-    "  quick-image env status --host <codex|openclaw|all>",
-    "  quick-image env reset --host <codex|openclaw|all>"
+    "  quick-image env set --host <codex|openclaw|workbuddy> --server-url <URL> --frontend-url <URL>",
+    "  quick-image env status --host <codex|openclaw|workbuddy>",
+    "  quick-image env reset --host <codex|openclaw|workbuddy>"
   ].join("\n"));
 }
 

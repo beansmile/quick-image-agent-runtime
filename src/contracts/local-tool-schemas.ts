@@ -171,13 +171,3 @@ function nullablePositiveNumberSchema(description: string) {
   return schema;
 }
 
-export const environmentCheckOutputSchema = z.object({
-  hosts: z.array(z.object({
-    host: z.enum(["codex", "openclaw"]).describe("宿主名称"),
-    available: z.boolean().describe("该宿主当前是否可以检查"),
-    is_production: z.boolean().nullable().describe("当前生效环境是否为正式环境；无法判定时为 null"),
-    source: z.string().describe(
-      "配置来源：plugin-default（插件正式默认）、production-default（宿主正式默认）、custom（自定义覆盖）、external（外部配置）、missing（未配置）、unavailable（宿主不可检查）"
-    )
-  })).describe("各宿主的环境检查结果；出于安全考虑不包含任何服务器或前端地址")
-});

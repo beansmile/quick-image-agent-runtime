@@ -11,7 +11,7 @@ export interface EnvironmentUrls {
 }
 
 export interface EnvironmentStatus {
-  host: "codex" | "openclaw";
+  host: "codex" | "openclaw" | "workbuddy";
   configured: boolean;
   source: "plugin-default" | "custom" | "production-default" | "external" | "missing";
   serverUrl?: string;
