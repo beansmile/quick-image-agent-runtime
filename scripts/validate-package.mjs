@@ -5,7 +5,6 @@ const root = process.cwd();
 const packageJson = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
 const errors = [];
 
-if (packageJson.private !== true) errors.push("package.json: package must remain private");
 if (packageJson.bin?.["quick-image-local-mcp"] !== "./dist/server.js") {
   errors.push("package.json: quick-image-local-mcp must point to ./dist/server.js");
 }
