@@ -1,4 +1,4 @@
-import { copyFile, lstat, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { lstat, readFile, stat } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,13 +10,24 @@ import {
   type EnvironmentStatus,
   type EnvironmentUrls
 } from "./config.js";
+import {
+  parseJsonManifestText,
+  serializeJsonManifestText,
+  stripByteOrderMark,
+  writeJsonManifestAtomic
+} from "./json-manifest.js";
 
-// WorkBuddy 没有 env 配置 CLI；它把插件 MCP 清单（.workbuddy-plugin/plugin.json
-// 的 mcpServers 字段指向的文件，当前为 ./.mcp.json）从插件安装目录直接加载为
-// custom-mcp 配置。因此环境切换通过改写插件安装目录内的该清单文件实现：
-// 只更新 mcpServers.quick-image 的 url 与 X-Quick-Image-Frontend-URL 两个头，
-// 其余配置语义保持不变，并按原文还原 BOM、缩进、行尾与结尾换行；写入前备份，
-// 写入后回读校验，失败自动恢复原文，多安装时先整体规划再统一写入。
+export { serializeJsonManifestText as serializeWorkBuddyManifestText } from "./json-manifest.js";
+
+// WorkBuddy 没有 env 配置 CLI；它把插件 MCP 清单（插件 manifest 的
+// mcpServers 字段指向的文件）从插件安装目录直接加载为 custom-mcp 配置。
+// 插件包同时携带 .workbuddy-plugin 与 .codebuddy-plugin 两份 manifest，
+// 分别指向 ./.mcp.json 与 ./mcp.json：旧版客户端读前者，新版客户端还会
+// 加载后者。因此环境切换收集安装目录内全部候选 manifest 指向的清单并
+// 同步改写，只更新 mcpServers.quick-image 的 url 与
+// X-Quick-Image-Frontend-URL 两个头，其余配置语义保持不变，并按原文
+// 还原 BOM、缩进、行尾与结尾换行；写入前备份，写入后回读校验，失败
+// 自动恢复原文，多安装多清单时先整体规划再统一写入。
 // 插件缓存以 installed_plugins.json 为权威注册表，孤儿目录（带 .orphaned_at）
 // 不会出现在其中，避免误改已废弃的安装。
 const WORKBUDDY_MANIFEST_CANDIDATES = [".workbuddy-plugin/plugin.json", ".codebuddy-plugin/plugin.json"] as const;
@@ -30,7 +41,7 @@ export interface WorkBuddyOptions {
 
 interface WorkBuddyInstall {
   root: string;
-  mcpPath: string;
+  mcpPaths: string[];
 }
 
 interface WorkBuddyMcpUpdatePlan {
@@ -47,11 +58,13 @@ export async function setWorkBuddyEnvironment(urls: EnvironmentUrls, options: Wo
     throw new Error("在 WorkBuddy 中找不到 quick-image 插件安装，请先在 WorkBuddy 中安装 Quick Image Plugin");
   }
   // 多个安装（不同 scope）先全部完成解析与改写计算，再统一写入：任何一个安装
-  // 无法解析时不会动任何文件；写入阶段中途失败时把已写入的安装回滚为原文，
-  // 避免宿主按不同 scope 加载到混合环境。
+  // 的任何一份清单无法解析时不会动任何文件；写入阶段中途失败时把已写入的清单
+  // 回滚为原文，避免宿主按不同 scope 或不同 manifest 加载到混合环境。
   const plans = [];
   for (const install of installs) {
-    plans.push(await planWorkBuddyMcpUpdate(install.mcpPath, urls));
+    for (const mcpPath of install.mcpPaths) {
+      plans.push(await planWorkBuddyMcpUpdate(mcpPath, urls));
+    }
   }
   const committed: WorkBuddyMcpUpdatePlan[] = [];
   try {
@@ -62,7 +75,7 @@ export async function setWorkBuddyEnvironment(urls: EnvironmentUrls, options: Wo
   } catch (error) {
     // 回滚失败时保留各安装的备份文件供人工恢复，原始错误仍然如实上抛。
     for (const plan of committed) {
-      await writeAtomic(plan.mcpPath, plan.originalText, plan.mode).catch(() => undefined);
+      await writeJsonManifestAtomic(plan.mcpPath, plan.originalText, plan.mode).catch(() => undefined);
     }
     throw error;
   }
@@ -89,20 +102,23 @@ export async function readWorkBuddyEnvironmentStatus(options: WorkBuddyOptions):
   } catch {
     return { host: "workbuddy", configured: false, source: "missing" };
   }
-  // 多个安装（不同 scope）同时存在时取第一个可读出 quick-image 配置的文件；
-  // set/reset 会同步更新全部安装，正常情况下不会出现不一致。
+  // 多个安装（不同 scope）与同一安装的多份清单同时存在时，取第一个可读出
+  // quick-image 配置的文件；set/reset 会同步更新全部安装的全部清单，正常
+  // 情况下不会出现不一致。
   for (const install of installs) {
-    const urls = await readWorkBuddyMcpUrls(install.mcpPath);
-    if (!urls) continue;
-    const usesProduction = urls.serverUrl === QUICK_IMAGE_PRODUCTION_SERVER_URL &&
-      urls.frontendUrl === QUICK_IMAGE_PRODUCTION_FRONTEND_URL;
-    return {
-      host: "workbuddy",
-      configured: true,
-      source: usesProduction ? "plugin-default" : "custom",
-      serverUrl: urls.serverUrl,
-      frontendUrl: urls.frontendUrl
-    };
+    for (const mcpPath of install.mcpPaths) {
+      const urls = await readWorkBuddyMcpUrls(mcpPath);
+      if (!urls) continue;
+      const usesProduction = urls.serverUrl === QUICK_IMAGE_PRODUCTION_SERVER_URL &&
+        urls.frontendUrl === QUICK_IMAGE_PRODUCTION_FRONTEND_URL;
+      return {
+        host: "workbuddy",
+        configured: true,
+        source: usesProduction ? "plugin-default" : "custom",
+        serverUrl: urls.serverUrl,
+        frontendUrl: urls.frontendUrl
+      };
+    }
   }
   return { host: "workbuddy", configured: false, source: "missing" };
 }
@@ -140,28 +156,6 @@ export function applyWorkBuddyMcpUrls(
     updatedEntry.headers = { [QUICK_IMAGE_FRONTEND_HEADER]: urls.frontendUrl };
   }
   return { ...manifest, mcpServers: { ...servers, [QUICK_IMAGE_MCP_NAME]: updatedEntry } };
-}
-
-export function serializeWorkBuddyManifestText(value: Record<string, unknown>, originalText: string): string {
-  // Windows 工具写 JSON 可能带 UTF-8 BOM 且 JSON.parse 无法直接解析；
-  // 序列化时按原文还原 BOM、缩进、行尾与结尾换行，尽量少改动无关字节。
-  const byteOrderMark = originalText.charCodeAt(0) === 0xfeff ? "\uFEFF" : "";
-  const lineEnding = originalText.includes("\r\n") ? "\r\n" : "\n";
-  const serialized = serializeWithOriginalWhitespace(value, originalText);
-  const body = lineEnding === "\r\n" ? serialized.replace(/\n/g, "\r\n") : serialized;
-  const trailingNewline = originalText.endsWith("\n") ? lineEnding : "";
-  return `${byteOrderMark}${body}${trailingNewline}`;
-}
-
-// JSON.stringify 的产物不含裸换行，逐个替换 \n 为 \r\n 不会破坏字符串内容。
-function serializeWithOriginalWhitespace(value: Record<string, unknown>, originalText: string): string {
-  const text = stripByteOrderMark(originalText);
-  const firstLineBreak = text.indexOf("\n");
-  // 原文没有换行，或唯一换行是结尾换行，说明是单行压缩格式，保持压缩。
-  if (firstLineBreak === -1 || firstLineBreak === text.length - 1) return JSON.stringify(value);
-  const indent = /^[ \t]+/.exec(text.slice(firstLineBreak + 1))?.[0];
-  if (!indent) return JSON.stringify(value, null, 2);
-  return JSON.stringify(value, null, indent.slice(0, 10));
 }
 
 export function verifyWorkBuddyManifest(
@@ -219,8 +213,8 @@ async function resolveWorkBuddyInstalls(home: string): Promise<WorkBuddyInstall[
   }
   const installs: WorkBuddyInstall[] = [];
   for (const root of roots) {
-    const mcpPath = await resolveWorkBuddyMcpPath(root);
-    if (mcpPath) installs.push({ root, mcpPath });
+    const mcpPaths = await resolveWorkBuddyMcpPaths(root);
+    if (mcpPaths.length > 0) installs.push({ root, mcpPaths });
   }
   return installs;
 }
@@ -232,7 +226,8 @@ function workBuddyPluginKeyMatches(key: string): boolean {
   return name === QUICK_IMAGE_MCP_NAME;
 }
 
-async function resolveWorkBuddyMcpPath(root: string): Promise<string | undefined> {
+async function resolveWorkBuddyMcpPaths(root: string): Promise<string[]> {
+  const mcpPaths: string[] = [];
   for (const relativePath of WORKBUDDY_MANIFEST_CANDIDATES) {
     const manifestPath = path.join(root, relativePath);
     const manifest = await readOptionalJson(manifestPath);
@@ -244,9 +239,10 @@ async function resolveWorkBuddyMcpPath(root: string): Promise<string | undefined
     if (!pathContains(root, mcpPath)) {
       throw new Error(`WorkBuddy MCP 清单路径超出插件目录：${manifest.mcpServers}`);
     }
-    return mcpPath;
+    // 两份 manifest 可能指向同一清单文件（历史布局），去重避免重复写两遍。
+    if (!mcpPaths.some((existing) => samePath(existing, mcpPath))) mcpPaths.push(mcpPath);
   }
-  return undefined;
+  return mcpPaths;
 }
 
 async function readWorkBuddyMcpUrls(mcpPath: string): Promise<EnvironmentUrls | undefined> {
@@ -261,7 +257,7 @@ async function readWorkBuddyMcpUrls(mcpPath: string): Promise<EnvironmentUrls | 
   // status 行为一致，set/reset 仍会对损坏文件显式报错。
   let manifest: Record<string, unknown>;
   try {
-    manifest = parseWorkBuddyManifestText(text, mcpPath);
+    manifest = parseJsonManifestText(text, mcpPath);
   } catch {
     return undefined;
   }
@@ -286,45 +282,32 @@ async function planWorkBuddyMcpUpdate(mcpPath: string, urls: EnvironmentUrls): P
   if (!details.isFile()) throw new Error(`WorkBuddy MCP 清单不是普通文件：${mcpPath}`);
 
   const originalText = await readFile(mcpPath, "utf8");
-  const original = parseWorkBuddyManifestText(originalText, mcpPath);
+  const original = parseJsonManifestText(originalText, mcpPath);
   const updated = applyWorkBuddyMcpUrls(original, urls);
   const { mode } = await stat(mcpPath);
   return {
     mcpPath,
     originalText,
     original,
-    updatedText: serializeWorkBuddyManifestText(updated, originalText),
+    updatedText: serializeJsonManifestText(updated, originalText),
     mode
   };
 }
 
 async function commitWorkBuddyMcpUpdate(plan: WorkBuddyMcpUpdatePlan, urls: EnvironmentUrls): Promise<void> {
   if (plan.originalText !== "") {
-    await writeAtomic(`${plan.mcpPath}${WORKBUDDY_BACKUP_SUFFIX}`, plan.originalText, plan.mode);
+    await writeJsonManifestAtomic(`${plan.mcpPath}${WORKBUDDY_BACKUP_SUFFIX}`, plan.originalText, plan.mode);
   }
-  await writeAtomic(plan.mcpPath, plan.updatedText, plan.mode);
+  await writeJsonManifestAtomic(plan.mcpPath, plan.updatedText, plan.mode);
   try {
-    const rewritten = parseWorkBuddyManifestText(await readFile(plan.mcpPath, "utf8"), plan.mcpPath);
+    const rewritten = parseJsonManifestText(await readFile(plan.mcpPath, "utf8"), plan.mcpPath);
     verifyWorkBuddyManifest(plan.original, rewritten, urls);
   } catch (error) {
-    await writeAtomic(plan.mcpPath, plan.originalText, plan.mode);
+    await writeJsonManifestAtomic(plan.mcpPath, plan.originalText, plan.mode);
     throw error;
   }
 }
 
-function parseWorkBuddyManifestText(text: string, source: string): Record<string, unknown> {
-  try {
-    const value: unknown = JSON.parse(stripByteOrderMark(text));
-    if (isObject(value)) return value;
-  } catch {
-    // 统一转译为带文件路径的错误，便于定位损坏的安装。
-  }
-  throw new Error(`WorkBuddy MCP 清单不是有效 JSON：${source}`);
-}
-
-function stripByteOrderMark(text: string): string {
-  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
-}
 
 async function readOptionalJson(filePath: string): Promise<Record<string, unknown> | undefined> {
   let text: string;
@@ -341,26 +324,6 @@ async function readOptionalJson(filePath: string): Promise<Record<string, unknow
     // 转译为下方统一错误。
   }
   throw new Error(`文件不是有效的 JSON 对象：${filePath}`);
-}
-
-async function writeAtomic(filePath: string, content: string, mode: number): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  const temporaryPath = `${filePath}.quick-image-${process.pid}.tmp`;
-  try {
-    await writeFile(temporaryPath, content, { mode });
-    try {
-      await rename(temporaryPath, filePath);
-    } catch (error) {
-      if (process.platform !== "win32") throw error;
-      // Windows 上宿主进程短暂占用目标文件时 rename 可能失败；退化为
-      // copyFile+unlink，内容仍按整块覆盖，不会写出半个清单。
-      await copyFile(temporaryPath, filePath);
-      await unlink(temporaryPath);
-    }
-  } catch (error) {
-    await unlink(temporaryPath).catch(() => undefined);
-    throw error;
-  }
 }
 
 function samePath(left: string, right: string): boolean {

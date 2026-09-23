@@ -2,7 +2,7 @@
 
 Quick Image Agent Runtime 是 Quick Image Agent Plugin 使用的本地处理运行时。它负责在用户设备上检查和预处理会话附件、执行确定性估价，将暂存附件上传到 Quick Image 服务签发的目标，并把任务结果的预览媒体受约束地下载到私有缓存目录供宿主以本地文件投递（仅 HTTPS、拒绝重定向、超时与大小上限、magic bytes 校验；缓存仅按容量阈值从旧到新淘汰）。
 
-同一个包也导出本地处理核心 API。Codex 等 MCP 宿主启动 `quick-image-local-mcp`，OpenClaw 原生适配器直接导入核心 API，从而复用完全相同的媒体处理、估价、上传和预览下载实现。
+同一个包也导出本地处理核心 API 和 `quick-image-local-mcp` stdio 入口。Codex、WorkBuddy、OpenClaw 等 MCP 宿主统一启动 `quick-image-local-mcp`，复用完全相同的媒体处理、估价和上传实现；OpenClaw 原生适配器额外导入核心 API 的预览下载服务，用于向聊天渠道投递生成结果。
 
 本仓库不处理登录、素材归属、最终计价、扣费或任务状态；这些权威业务逻辑保留在 Quick Image 服务端。
 
@@ -48,7 +48,7 @@ quick-image env status --host <codex|openclaw|workbuddy>
 quick-image env reset --host <codex|openclaw|workbuddy>
 ```
 
-完整执行时，上述两条命令同样需要加上 `npx --yes --prefer-online --package quick-image-agent-runtime@latest` 前缀。命令只改写 quick-image 自身的 MCP 配置：写入前自动备份、写入后校验、失败自动恢复，不影响宿主的其他配置。切换地址不会迁移 OAuth 凭据，完成后需重新授权 quick-image MCP：Codex 执行 `codex mcp login quick-image` 并新建任务加载配置；WorkBuddy 完全退出并重新打开后重新授权；OpenClaw 执行 `openclaw mcp login quick-image`，配置即时生效。WorkBuddy 主目录不在默认位置时可用 `WORKBUDDY_HOME` 环境变量指定；同版本号重装 WorkBuddy 插件不会还原配置，恢复正式环境需执行 `env reset`。
+完整执行时，上述两条命令同样需要加上 `npx --yes --prefer-online --package quick-image-agent-runtime@latest` 前缀。命令只改写 quick-image 自身的 MCP 配置：写入前自动备份、写入后校验、失败自动恢复，不影响宿主的其他配置。切换地址不会迁移 OAuth 凭据，完成后需重新授权 quick-image MCP：Codex 执行 `codex mcp login quick-image` 并新建任务加载配置；WorkBuddy 完全退出并重新打开后重新授权；OpenClaw 执行 `openclaw mcp login quick-image`，配置即时生效。WorkBuddy 主目录不在默认位置时可用 `WORKBUDDY_HOME` 环境变量指定；同版本号重装 WorkBuddy 插件不会还原配置，恢复正式环境需执行 `env reset`。Codex 插件更新或重装会把清单还原为插件默认的正式地址，需要时重新执行 `env set`。
 
 ## 本地开发
 

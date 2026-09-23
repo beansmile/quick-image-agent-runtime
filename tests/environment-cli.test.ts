@@ -5,13 +5,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CommandExecutor } from "../src/environment/command-executor.js";
 import {
-  containsManagedBlock,
-  MANAGED_BLOCK_BEGIN,
-  MANAGED_BLOCK_END,
-  removeCodexManagedBlock,
+  readCodexEnvironmentStatus,
   resetCodexEnvironment,
-  setCodexEnvironment,
-  upsertCodexManagedBlock
+  setCodexEnvironment
 } from "../src/environment/codex.js";
 import {
   buildOpenClawMcpConfig,
@@ -73,243 +69,135 @@ describe("Quick Image environment URL validation", () => {
   });
 });
 
-describe("Codex managed MCP override", () => {
-  const urls = {
+describe("Codex environment adapter", () => {
+  const stagingUrls = {
     serverUrl: "https://staging-api.example.com/mcp",
     frontendUrl: "https://staging.example.com"
   };
 
-  it("adds, replaces, and removes only the marked Quick Image block", () => {
-    const original = 'model = "gpt-test"\n';
-    const added = upsertCodexManagedBlock(original, urls, "0.1.0");
-    expect(containsManagedBlock(added)).toBe(true);
-    expect(added).toContain('url = "https://staging-api.example.com/mcp"');
-    expect(added).toContain('"X-Quick-Image-Frontend-URL" = "https://staging.example.com"');
-
-    const replaced = upsertCodexManagedBlock(added, {
-      serverUrl: "http://127.0.0.1:3000/mcp",
-      frontendUrl: "http://127.0.0.1:8001"
-    }, "0.2.0");
-    expect(replaced.match(/BEGIN quick-image/g)).toHaveLength(1);
-    expect(replaced).not.toContain("staging-api.example.com");
-    expect(removeCodexManagedBlock(replaced)).toBe(original);
-  });
-
-  it("refuses to overwrite an unowned Quick Image table or broken markers", () => {
-    expect(() => upsertCodexManagedBlock(
-      '[mcp_servers."quick-image"]\nurl = "https://example.com/mcp"\n',
-      urls,
-      "0.1.0"
-    )).toThrow("非 Quick Image 管理");
-    // 孤立标记且无指纹表体：无法识别归属，set 拒绝、contains 报告不存在
-    expect(() => upsertCodexManagedBlock(
-      "# BEGIN quick-image managed MCP environment\n",
-      urls,
-      "0.1.0"
-    )).toThrow("标记不完整或重复");
-    expect(containsManagedBlock("# BEGIN quick-image managed MCP environment\n")).toBe(false);
-    // 带两个 Quick Image 私有头的手写表（含 oauth_resource 但与 url 不同值）
-    // 视为 Quick Image 自定义配置：set 救援替换而非拒绝
-    const handWritten = [
-      "[mcp_servers.quick-image]",
-      'url = "https://a.example.com/mcp"',
-      'oauth_resource = "https://b.example.com/mcp"',
-      'http_headers = { "X-Quick-Image-Plugin-Version" = "9.9.9", "X-Quick-Image-Frontend-URL" = "https://c.example.com" }',
-      ""
-    ].join("\n");
-    const taken = upsertCodexManagedBlock(handWritten, urls, "0.1.0");
-    expect(taken.match(/BEGIN quick-image/g)).toHaveLength(1);
-    expect(taken).not.toContain("a.example.com");
-    expect(removeCodexManagedBlock(taken)).toBe("");
-  });
-
-  it("repairs a damaged block using the table fingerprint", () => {
-    const original = 'model = "gpt-test"\n';
-    const added = upsertCodexManagedBlock(original, urls, "0.1.0");
-
-    // 场景一：END 标记行被删除，表体残留
-    const missingEnd = added.split("\n").filter((line) => line !== MANAGED_BLOCK_END).join("\n");
-    const repairedBySet = upsertCodexManagedBlock(missingEnd, {
-      serverUrl: "http://127.0.0.1:3000/mcp",
-      frontendUrl: "http://127.0.0.1:8001"
-    }, "0.2.0");
-    expect(repairedBySet.match(/BEGIN quick-image/g)).toHaveLength(1);
-    expect(repairedBySet).not.toContain("staging-api.example.com");
-    expect(repairedBySet).toContain('url = "http://127.0.0.1:3000/mcp"');
-    expect(removeCodexManagedBlock(repairedBySet)).toBe(original);
-
-    // 场景二：两个标记行都被删除，只剩指纹表体
-    const noMarkers = added.split("\n").filter((line) =>
-      line !== MANAGED_BLOCK_BEGIN && line !== MANAGED_BLOCK_END
-    ).join("\n");
-    expect(containsManagedBlock(noMarkers)).toBe(true);
-    expect(removeCodexManagedBlock(noMarkers)).toBe(original);
-    expect(() => upsertCodexManagedBlock(noMarkers, urls, "0.1.0")).not.toThrow();
-  });
-
-  it("repairs a block whose inline headers were expanded into sub-tables", () => {
-    // 第三方 TOML 重写工具可能把 http_headers 内联表展开成子表；
-    // 救援必须连同子表一起清理，且不波及后续其他表。
-    const expanded = [
-      'model = "gpt-test"\n\n',
-      "[mcp_servers.quick-image]\n",
-      'url = "https://staging-api.example.com/mcp"\n',
-      'oauth_resource = "https://staging-api.example.com/mcp"\n',
-      'auth = "oauth"\n',
-      "[mcp_servers.quick-image.http_headers]\n",
-      '"X-Quick-Image-Plugin-Version" = "0.1.0"\n',
-      '"X-Quick-Image-Frontend-URL" = "https://staging.example.com"\n\n',
-      "[mcp_servers.other]\n",
-      'key = "value"\n'
-    ].join("");
-    expect(containsManagedBlock(expanded)).toBe(true);
-    const removed = removeCodexManagedBlock(expanded);
-    expect(removed).toBe('model = "gpt-test"\n\n[mcp_servers.other]\nkey = "value"\n');
-    expect(() => upsertCodexManagedBlock(expanded, urls, "0.1.0")).not.toThrow();
-  });
-
-  it("rescue leaves content outside the repaired section byte-identical", () => {
-    // 多行字符串内部的连续空行、逐字引用的标记文本，以及接缝处原有的空行
-    // 都属于区块外内容，救援不得改动；只有被删除的表本身可以消失。
-    const source = [
-      'model = "gpt-test"\n',
-      `prompt = """\n${MANAGED_BLOCK_BEGIN}\nkeep\n\n\nme\n"""\n`,
-      "[mcp_servers.quick-image]\n",
-      'url = "https://staging-api.example.com/mcp"\n',
-      'oauth_resource = "https://staging-api.example.com/mcp"\n',
-      'auth = "oauth"\n',
-      'http_headers = { "X-Quick-Image-Plugin-Version" = "0.1.0", "X-Quick-Image-Frontend-URL" = "https://staging.example.com" }\n',
-      "[mcp_servers.other]\n",
-      'notes = """\npara one\n\n\npara two\n"""\n'
-    ].join("");
-    const removed = removeCodexManagedBlock(source);
-    expect(removed).toBe([
-      'model = "gpt-test"\n',
-      `prompt = """\n${MANAGED_BLOCK_BEGIN}\nkeep\n\n\nme\n"""\n`,
-      "[mcp_servers.other]\n",
-      'notes = """\npara one\n\n\npara two\n"""\n'
-    ].join(""));
-    expect(() => upsertCodexManagedBlock(source, urls, "0.1.0")).not.toThrow();
-  });
-
-  it("writes an atomic user override and reset falls back to the plugin defaults", async () => {
-    const directory = await temporaryDirectory();
-    const configPath = path.join(directory, "config.toml");
-    await writeFile(configPath, 'model = "gpt-test"\n');
-    let effective = urls;
-    const executor = codexExecutor(() => effective);
-
-    const status = await setCodexEnvironment(urls, {
-      runtimeVersion: "0.1.0",
-      codexBin: "/bin/echo",
-      configPath,
-      executor
-    });
-    expect(status).toMatchObject({ host: "codex", source: "custom", ...urls });
-    await expect(readFile(configPath, "utf8")).resolves.toContain("BEGIN quick-image managed MCP environment");
-    await expect(readFile(`${configPath}.quick-image-backup`, "utf8")).resolves.toBe('model = "gpt-test"\n');
-
-    effective = productionEnvironmentUrls();
-    const reset = await resetCodexEnvironment({
-      runtimeVersion: "0.1.0",
-      codexBin: "/bin/echo",
-      configPath,
-      executor
-    });
-    expect(reset).toMatchObject({ host: "codex", source: "plugin-default", ...effective });
-    await expect(readFile(configPath, "utf8")).resolves.toBe('model = "gpt-test"\n');
-  });
-
-  it("restores the original file and keeps the backup when verification fails", async () => {
-    const directory = await temporaryDirectory();
-    const configPath = path.join(directory, "config.toml");
-    await writeFile(configPath, 'model = "gpt-test"\n');
-    const executor: CommandExecutor = {
-      run: vi.fn((_executable, args) => {
-        if (args[0] === "mcp" && args[1] === "get") {
-          return {
-            stdout: JSON.stringify({
-              transport: {
-                url: "https://unexpected.example.com/mcp",
-                http_headers: {
-                  "X-Quick-Image-Plugin-Version": "0.1.0",
-                  "X-Quick-Image-Frontend-URL": "https://unexpected.example.com"
-                }
-              }
-            }),
-            stderr: ""
-          };
-        }
-        return { stdout: "[]", stderr: "" };
-      })
-    };
-
-    await expect(setCodexEnvironment(urls, {
-      runtimeVersion: "0.1.0",
-      codexBin: "/bin/echo",
-      configPath,
-      executor
-    })).rejects.toThrow("未加载刚写入");
-    await expect(readFile(configPath, "utf8")).resolves.toBe('model = "gpt-test"\n');
-    await expect(readFile(`${configPath}.quick-image-backup`, "utf8")).resolves.toBe('model = "gpt-test"\n');
-  });
-
-  it("reset restores legacy manifest overrides back to production defaults", async () => {
+  it("updates both manifests in the marketplace copy and the install cache", async () => {
     const directory = await temporaryDirectory();
     const codexHome = path.join(directory, ".codex");
-    const marketplaceRoot = path.join(codexHome, ".tmp", "marketplaces", "quick-image");
-    const cacheRoot = path.join(codexHome, "plugins", "cache", "quick-image", "quick-image", "0.1.0");
+    const fixture = await writeCodexFixture(codexHome);
     vi.stubEnv("CODEX_HOME", codexHome);
-    await Promise.all([marketplaceRoot, cacheRoot].map((root) => writeContaminatedPluginFixture(root)));
+    const executor = codexManifestExecutor(fixture);
+
+    const status = await setCodexEnvironment(stagingUrls, { codexBin: "/bin/echo", executor });
+    expect(status).toMatchObject({ host: "codex", source: "custom", ...stagingUrls });
+    for (const mcpPath of fixture.mcpPaths) {
+      const updated = JSON.parse(await readFile(mcpPath, "utf8"));
+      expect(updated.mcpServers["quick-image"]).toMatchObject({
+        url: stagingUrls.serverUrl,
+        headers: { "X-Quick-Image-Frontend-URL": stagingUrls.frontendUrl },
+        http_headers: { "X-Quick-Image-Frontend-URL": stagingUrls.frontendUrl }
+      });
+      expect(updated.mcpServers["quick-image-local"]).toEqual(defaultCodexMcpValue().mcpServers["quick-image-local"]);
+      await expect(readFile(`${mcpPath}.quick-image-backup`, "utf8")).resolves.toBe(fixture.originalText);
+    }
+
+    const reset = await resetCodexEnvironment({ codexBin: "/bin/echo", executor });
+    expect(reset).toMatchObject({ host: "codex", source: "plugin-default", ...productionEnvironmentUrls() });
+    for (const mcpPath of fixture.mcpPaths) {
+      const restored = JSON.parse(await readFile(mcpPath, "utf8"));
+      expect(restored.mcpServers["quick-image"].url).toBe("https://quickimage.ai/mcp");
+    }
+  });
+
+  it("leaves every manifest untouched when a later manifest cannot be parsed", async () => {
+    const directory = await temporaryDirectory();
+    const codexHome = path.join(directory, ".codex");
+    const fixture = await writeCodexFixture(codexHome);
+    await writeFile(fixture.mcpPaths[3]!, "{ not json");
+    vi.stubEnv("CODEX_HOME", codexHome);
+
+    await expect(setCodexEnvironment(stagingUrls, { codexBin: "/bin/echo", executor: codexManifestExecutor(fixture) }))
+      .rejects.toThrow("不是有效 JSON");
+    await expect(readFile(fixture.mcpPaths[0]!, "utf8")).resolves.toBe(fixture.originalText);
+  });
+
+  it("leaves the manifest untouched when it lacks the quick-image entry", async () => {
+    const directory = await temporaryDirectory();
+    const codexHome = path.join(directory, ".codex");
+    const fixture = await writeCodexFixture(codexHome, {
+      cacheMcpContent: `${JSON.stringify({ mcpServers: { "other-server": { type: "stdio", command: "npx" } } })}\n`
+    });
+    vi.stubEnv("CODEX_HOME", codexHome);
+
+    await expect(setCodexEnvironment(stagingUrls, { codexBin: "/bin/echo", executor: codexManifestExecutor(fixture) }))
+      .rejects.toThrow("缺少 quick-image 配置");
+    await expect(readFile(fixture.mcpPaths[0]!, "utf8")).resolves.toBe(fixture.originalText);
+  });
+
+  it("restores already-written manifests when a later root fails to write", async () => {
+    // root 用户不受目录只读位约束；Windows 目录只读属性不阻止在其中创建与
+    // 重命名文件。两者都无法触发写入失败，跳过该路径。
+    if (process.platform === "win32" || process.getuid?.() === 0) return;
+    const directory = await temporaryDirectory();
+    const codexHome = path.join(directory, ".codex");
+    const fixture = await writeCodexFixture(codexHome);
+    vi.stubEnv("CODEX_HOME", codexHome);
+    // 只读的缓存目录让解析照常进行，但写入其中清单时失败，触发已写入的
+    // marketplace 清单回滚。
+    await chmod(fixture.cacheRoot, 0o500);
+    try {
+      await expect(setCodexEnvironment(stagingUrls, { codexBin: "/bin/echo", executor: codexManifestExecutor(fixture) }))
+        .rejects.toThrow();
+      for (const mcpPath of fixture.mcpPaths.slice(0, 2)) {
+        await expect(readFile(mcpPath, "utf8")).resolves.toBe(fixture.originalText);
+      }
+    } finally {
+      await chmod(fixture.cacheRoot, 0o700);
+    }
+  });
+
+  it("keeps the written manifests and reports when Codex loads other URLs", async () => {
+    const directory = await temporaryDirectory();
+    const codexHome = path.join(directory, ".codex");
+    const fixture = await writeCodexFixture(codexHome);
+    vi.stubEnv("CODEX_HOME", codexHome);
+    const executor = codexManifestExecutor(fixture, () => ({
+      serverUrl: "https://other.example.com/mcp",
+      frontendUrl: "https://other.example.com"
+    }));
+
+    await expect(setCodexEnvironment(stagingUrls, { codexBin: "/bin/echo", executor }))
+      .rejects.toThrow("未加载刚写入");
+    // 清单内容正确、不因外部覆盖回滚：冲突来源在宿主用户级配置。
+    const updated = JSON.parse(await readFile(fixture.mcpPaths[2]!, "utf8"));
+    expect(updated.mcpServers["quick-image"].url).toBe(stagingUrls.serverUrl);
+  });
+
+  it("reports missing and refuses to set when the plugin is not installed", async () => {
+    const directory = await temporaryDirectory();
+    const codexHome = path.join(directory, ".codex");
+    vi.stubEnv("CODEX_HOME", codexHome);
     const executor: CommandExecutor = {
       run: vi.fn((_executable, args) => {
-        if (args[0] === "plugin" && args[1] === "list") {
-          return {
-            stdout: JSON.stringify({
-              installed: [{
-                pluginId: "quick-image@quick-image",
-                name: "quick-image",
-                marketplaceName: "quick-image",
-                version: "0.1.0",
-                enabled: true,
-                source: { source: "local", path: marketplaceRoot }
-              }]
-            }),
-            stderr: ""
-          };
-        }
-        if (args[0] === "mcp" && args[1] === "get") {
-          const manifest = JSON.parse(readFileSync(path.join(cacheRoot, ".mcp.json"), "utf8"));
-          const server = manifest.mcpServers["quick-image"];
-          return {
-            stdout: JSON.stringify({
-              transport: {
-                url: server.url,
-                http_headers: {
-                  "X-Quick-Image-Plugin-Version": "0.1.0",
-                  "X-Quick-Image-Frontend-URL": server.http_headers["X-Quick-Image-Frontend-URL"]
-                }
-              }
-            }),
-            stderr: ""
-          };
-        }
-        return { stdout: "[]", stderr: "" };
+        if (args[0] === "plugin") return { stdout: JSON.stringify({ installed: [] }), stderr: "" };
+        throw new Error("mcp not found");
       })
     };
 
-    const reset = await resetCodexEnvironment({ runtimeVersion: "0.1.0", codexBin: "/bin/echo", executor });
-    expect(reset).toMatchObject({ host: "codex", source: "plugin-default", ...productionEnvironmentUrls() });
-    for (const root of [marketplaceRoot, cacheRoot]) {
-      for (const fileName of [".mcp.json", "mcp.json"]) {
-        const manifest = JSON.parse(await readFile(path.join(root, fileName), "utf8"));
-        expect(manifest.mcpServers["quick-image"]).toMatchObject({
-          url: "https://quickimage.ai/mcp",
-          headers: { "X-Quick-Image-Frontend-URL": "https://quickimage.ai" },
-          http_headers: { "X-Quick-Image-Frontend-URL": "https://quickimage.ai" }
-        });
-      }
-    }
+    await expect(readCodexEnvironmentStatus({ codexBin: "/bin/echo", executor })).resolves.toEqual({
+      host: "codex",
+      configured: false,
+      source: "missing"
+    });
+    await expect(setCodexEnvironment(stagingUrls, { codexBin: "/bin/echo", executor }))
+      .rejects.toThrow("无法从 Codex Plugin 列表定位");
+  });
+
+  it("preserves minified formatting without adding a trailing newline", async () => {
+    const directory = await temporaryDirectory();
+    const codexHome = path.join(directory, ".codex");
+    const minified = JSON.stringify(defaultCodexMcpValue());
+    const fixture = await writeCodexFixture(codexHome, { mcpContent: minified });
+    vi.stubEnv("CODEX_HOME", codexHome);
+
+    await setCodexEnvironment(stagingUrls, { codexBin: "/bin/echo", executor: codexManifestExecutor(fixture) });
+    const rewritten = await readFile(fixture.mcpPaths[0]!, "utf8");
+    expect(rewritten.endsWith("\n")).toBe(false);
+    expect(rewritten).toBe(JSON.stringify(JSON.parse(rewritten)));
   });
 });
 
@@ -417,12 +305,12 @@ describe("WorkBuddy environment adapter", () => {
     const directory = await temporaryDirectory();
     const workBuddyHome = path.join(directory, ".workbuddy");
     const fixture = await writeWorkBuddyFixture(workBuddyHome, {});
-    const originalText = await readFile(fixture.mcpPath, "utf8");
+    const originalText = await readFile(fixture.mcpPaths[0]!, "utf8");
 
     const status = await setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome });
     expect(status).toMatchObject({ host: "workbuddy", source: "custom", ...stagingUrls });
 
-    const updated = JSON.parse(await readFile(fixture.mcpPath, "utf8"));
+    const updated = JSON.parse(await readFile(fixture.mcpPaths[0]!, "utf8"));
     expect(updated.mcpServers["quick-image"]).toMatchObject({
       type: "http",
       url: stagingUrls.serverUrl,
@@ -430,7 +318,7 @@ describe("WorkBuddy environment adapter", () => {
       http_headers: { "X-Quick-Image-Frontend-URL": stagingUrls.frontendUrl }
     });
     expect(JSON.parse(originalText).mcpServers["quick-image-local"]).toEqual(updated.mcpServers["quick-image-local"]);
-    await expect(readFile(`${fixture.mcpPath}.quick-image-backup`, "utf8")).resolves.toBe(originalText);
+    await expect(readFile(`${fixture.mcpPaths[0]!}.quick-image-backup`, "utf8")).resolves.toBe(originalText);
 
     const reset = await resetWorkBuddyEnvironment({ workbuddyHome: workBuddyHome });
     expect(reset).toMatchObject({
@@ -448,8 +336,53 @@ describe("WorkBuddy environment adapter", () => {
 
     const status = await setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome });
     expect(status).toMatchObject({ host: "workbuddy", source: "custom", ...stagingUrls });
-    const updated = JSON.parse(await readFile(fixture.mcpPath, "utf8"));
+    const updated = JSON.parse(await readFile(fixture.mcpPaths[0]!, "utf8"));
     expect(updated.mcpServers["quick-image"].url).toBe(stagingUrls.serverUrl);
+  });
+
+  it("updates both plugin manifests when both layouts ship in one install", async () => {
+    // 新版 WorkBuddy 客户端还会加载 .codebuddy-plugin 布局指向的 mcp.json；
+    // set/reset 必须同步改写两份清单，否则宿主可能加载到混合环境。
+    const directory = await temporaryDirectory();
+    const workBuddyHome = path.join(directory, ".workbuddy");
+    const fixture = await writeWorkBuddyFixture(workBuddyHome, { manifest: "both" });
+
+    const status = await setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome });
+    expect(status).toMatchObject({ host: "workbuddy", source: "custom", ...stagingUrls });
+    for (const mcpPath of fixture.mcpPaths) {
+      const updated = JSON.parse(await readFile(mcpPath, "utf8"));
+      expect(updated.mcpServers["quick-image"]).toMatchObject({
+        url: stagingUrls.serverUrl,
+        headers: { "X-Quick-Image-Frontend-URL": stagingUrls.frontendUrl },
+        http_headers: { "X-Quick-Image-Frontend-URL": stagingUrls.frontendUrl }
+      });
+      await expect(readFile(`${mcpPath}.quick-image-backup`, "utf8")).resolves.toBe(fixture.originalText);
+    }
+
+    const reset = await resetWorkBuddyEnvironment({ workbuddyHome: workBuddyHome });
+    expect(reset).toMatchObject({
+      host: "workbuddy",
+      source: "plugin-default",
+      serverUrl: "https://quickimage.ai/mcp",
+      frontendUrl: "https://quickimage.ai"
+    });
+    for (const mcpPath of fixture.mcpPaths) {
+      const restored = JSON.parse(await readFile(mcpPath, "utf8"));
+      expect(restored.mcpServers["quick-image"].url).toBe("https://quickimage.ai/mcp");
+    }
+  });
+
+  it("leaves every manifest untouched when the new-layout manifest lacks the entry", async () => {
+    const directory = await temporaryDirectory();
+    const workBuddyHome = path.join(directory, ".workbuddy");
+    const fixture = await writeWorkBuddyFixture(workBuddyHome, { manifest: "both" });
+    await writeFile(fixture.mcpPaths[1]!, JSON.stringify({
+      mcpServers: { "other-server": { type: "stdio", command: "npx" } }
+    }));
+
+    await expect(setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome }))
+      .rejects.toThrow("缺少 quick-image 配置");
+    await expect(readFile(fixture.mcpPaths[0]!, "utf8")).resolves.toBe(fixture.originalText);
   });
 
   it("reports missing and refuses to set when the plugin is not registered", async () => {
@@ -483,7 +416,7 @@ describe("WorkBuddy environment adapter", () => {
 
     await expect(setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome }))
       .rejects.toThrow("不是有效 JSON");
-    await expect(readFile(fixture.mcpPath, "utf8")).resolves.toBe(fixture.originalText);
+    await expect(readFile(fixture.mcpPaths[0]!, "utf8")).resolves.toBe(fixture.originalText);
   });
 
   it("restores already-written installs when a later install fails to write", async () => {
@@ -499,7 +432,7 @@ describe("WorkBuddy environment adapter", () => {
     await chmod(lockedRoot, 0o500);
     try {
       await expect(setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome })).rejects.toThrow();
-      await expect(readFile(fixture.mcpPath, "utf8")).resolves.toBe(fixture.originalText);
+      await expect(readFile(fixture.mcpPaths[0]!, "utf8")).resolves.toBe(fixture.originalText);
     } finally {
       await chmod(lockedRoot, 0o700);
     }
@@ -514,7 +447,7 @@ describe("WorkBuddy environment adapter", () => {
 
     await expect(setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome }))
       .rejects.toThrow("缺少 quick-image 配置");
-    await expect(readFile(missingEntry.mcpPath, "utf8")).resolves.toBe(missingEntry.originalText);
+    await expect(readFile(missingEntry.mcpPaths[0]!, "utf8")).resolves.toBe(missingEntry.originalText);
   });
 
   it("reports missing instead of failing when the registry or plugin manifest is unreadable", async () => {
@@ -548,7 +481,7 @@ describe("WorkBuddy environment adapter", () => {
     });
 
     await setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome });
-    const rewritten = await readFile(fixture.mcpPath, "utf8");
+    const rewritten = await readFile(fixture.mcpPaths[0]!, "utf8");
     expect(rewritten.charCodeAt(0)).toBe(0xfeff);
     expect(rewritten.endsWith("\n")).toBe(false);
     // BOM 由读取方剥离（parseWorkBuddyManifestText），剥离后必须仍是有效 JSON。
@@ -562,7 +495,7 @@ describe("WorkBuddy environment adapter", () => {
     const fixture = await writeWorkBuddyFixture(workBuddyHome, { mcpContent: crlfText, trailingNewline: false });
 
     await setWorkBuddyEnvironment(stagingUrls, { workbuddyHome: workBuddyHome });
-    const rewritten = await readFile(fixture.mcpPath, "utf8");
+    const rewritten = await readFile(fixture.mcpPaths[0]!, "utf8");
     const parsed = JSON.parse(rewritten);
     expect(parsed.mcpServers["quick-image"].url).toBe(stagingUrls.serverUrl);
     // 行尾全部保持 CRLF，缩进保持 4 空格：与重新格式化的语义等价文本完全一致。
@@ -625,28 +558,6 @@ describe("WorkBuddy environment adapter", () => {
   });
 });
 
-function codexExecutor(urls: () => { serverUrl: string; frontendUrl: string }): CommandExecutor {
-  return {
-    run: vi.fn((_executable, args) => {
-      if (args[0] === "mcp" && args[1] === "get") {
-        return {
-          stdout: JSON.stringify({
-            transport: {
-              url: urls().serverUrl,
-              http_headers: {
-                "X-Quick-Image-Plugin-Version": "0.1.0",
-                "X-Quick-Image-Frontend-URL": urls().frontendUrl
-              }
-            }
-          }),
-          stderr: ""
-        };
-      }
-      return { stdout: "[]", stderr: "" };
-    })
-  };
-}
-
 async function temporaryDirectory(): Promise<string> {
   const directory = await mkdtemp(path.join(os.tmpdir(), "quick-image-env-test-"));
   temporaryDirectories.push(directory);
@@ -654,12 +565,13 @@ async function temporaryDirectory(): Promise<string> {
 }
 
 interface WorkBuddyFixture {
-  mcpPath: string;
+  root: string;
+  mcpPaths: string[];
   originalText: string;
 }
 
 interface WorkBuddyFixtureOptions {
-  manifest?: ".workbuddy-plugin" | ".codebuddy-plugin";
+  manifest?: ".workbuddy-plugin" | ".codebuddy-plugin" | "both";
   mcpServers?: string;
   mcpContent?: string;
   manifestContent?: string;
@@ -670,23 +582,28 @@ interface WorkBuddyFixtureOptions {
 }
 
 async function writeWorkBuddyFixture(home: string, options: WorkBuddyFixtureOptions): Promise<WorkBuddyFixture> {
-  const manifestDir = options.manifest ?? ".workbuddy-plugin";
-  const mcpFileName = manifestDir === ".workbuddy-plugin" ? ".mcp.json" : "mcp.json";
+  const manifestDirs = options.manifest === "both"
+    ? [".workbuddy-plugin", ".codebuddy-plugin"] as const
+    : [options.manifest ?? ".workbuddy-plugin"];
   const registryKey = options.registryKey ?? "quick-image@quick-image";
   const root = path.join(home, "plugins", "cache", "quick-image", "quick-image", options.installPathSuffix ?? "0.1.8");
-  await mkdir(path.join(root, manifestDir), { recursive: true });
-  await writeFile(path.join(root, manifestDir, "plugin.json"), options.manifestContent ?? JSON.stringify({
-    name: "quick-image",
-    version: "0.1.8",
-    skills: "./skills/",
-    mcpServers: options.mcpServers ?? `./${mcpFileName}`
-  }));
-  const mcpPath = path.join(root, mcpFileName);
+  const mcpPaths: string[] = [];
+  for (const manifestDir of manifestDirs) {
+    const mcpFileName = manifestDir === ".workbuddy-plugin" ? ".mcp.json" : "mcp.json";
+    await mkdir(path.join(root, manifestDir), { recursive: true });
+    await writeFile(path.join(root, manifestDir, "plugin.json"), options.manifestContent ?? JSON.stringify({
+      name: "quick-image",
+      version: "0.1.8",
+      skills: "./skills/",
+      mcpServers: options.mcpServers ?? `./${mcpFileName}`
+    }));
+    mcpPaths.push(path.join(root, mcpFileName));
+  }
   const serialized = options.mcpContent === undefined
     ? JSON.stringify(defaultWorkBuddyMcpValue(), null, 2)
     : options.mcpContent;
   const originalText = `${options.byteOrderMark ? "\uFEFF" : ""}${serialized}${options.trailingNewline === false ? "" : "\n"}`;
-  await writeFile(mcpPath, originalText);
+  await Promise.all(mcpPaths.map((mcpPath) => writeFile(mcpPath, originalText)));
   await mkdir(path.join(home, "plugins"), { recursive: true });
   await writeFile(path.join(home, "plugins", "installed_plugins.json"), JSON.stringify({
     version: 2,
@@ -707,7 +624,7 @@ async function writeWorkBuddyFixture(home: string, options: WorkBuddyFixtureOpti
       }]
     }
   }));
-  return { mcpPath, originalText };
+  return { root, mcpPaths, originalText };
 }
 
 // 追加第二个（不同 scope 的）quick-image 安装并登记进现有注册表，
@@ -757,31 +674,111 @@ function defaultWorkBuddyMcpValue() {
   };
 }
 
-async function writeContaminatedPluginFixture(root: string): Promise<void> {
-  await mkdir(path.join(root, ".codex-plugin"), { recursive: true });
-  await writeFile(path.join(root, ".codex-plugin", "plugin.json"), JSON.stringify({
-    name: "quick-image",
-    version: "0.1.0",
-    mcpServers: "./.mcp.json"
-  }));
-  const manifest = JSON.stringify({
+interface CodexFixture {
+  marketplaceRoot: string;
+  cacheRoot: string;
+  /** [marketplace/.mcp.json, marketplace/mcp.json, cache/.mcp.json, cache/mcp.json] */
+  mcpPaths: string[];
+  originalText: string;
+}
+
+interface CodexFixtureOptions {
+  mcpContent?: string;
+  cacheMcpContent?: string;
+}
+
+async function writeCodexFixture(codexHome: string, options: CodexFixtureOptions = {}): Promise<CodexFixture> {
+  const marketplaceRoot = path.join(codexHome, ".tmp", "marketplaces", "quick-image");
+  const cacheRoot = path.join(codexHome, "plugins", "cache", "quick-image", "quick-image", "0.2.1");
+  const mcpPaths: string[] = [];
+  for (const root of [marketplaceRoot, cacheRoot]) {
+    await mkdir(path.join(root, ".codex-plugin"), { recursive: true });
+    await writeFile(path.join(root, ".codex-plugin", "plugin.json"), JSON.stringify({
+      name: "quick-image",
+      version: "0.2.1",
+      mcpServers: "./.mcp.json"
+    }));
+    for (const fileName of [".mcp.json", "mcp.json"]) mcpPaths.push(path.join(root, fileName));
+  }
+  const originalText = `${JSON.stringify(defaultCodexMcpValue(), null, 2)}\n`;
+  const marketplaceText = options.mcpContent ?? originalText;
+  const cacheText = options.cacheMcpContent ?? options.mcpContent ?? originalText;
+  await writeFile(mcpPaths[0]!, marketplaceText);
+  await writeFile(mcpPaths[1]!, marketplaceText);
+  await writeFile(mcpPaths[2]!, cacheText);
+  await writeFile(mcpPaths[3]!, cacheText);
+  return { marketplaceRoot, cacheRoot, mcpPaths, originalText };
+}
+
+// 生效配置的权威来源是安装缓存里的 .mcp.json（与真实 Codex 行为一致），
+// executor 据此回报 mcp get；plugin list 的 source.path 指向 marketplace 副本。
+function codexManifestExecutor(
+  fixture: CodexFixture,
+  effectiveUrls?: () => { serverUrl: string; frontendUrl: string }
+): CommandExecutor {
+  return {
+    run: vi.fn((_executable, args) => {
+      if (args[0] === "plugin" && args[1] === "list") {
+        return {
+          stdout: JSON.stringify({
+            installed: [{
+              pluginId: "quick-image@quick-image",
+              name: "quick-image",
+              marketplaceName: "quick-image",
+              version: "0.2.1",
+              enabled: true,
+              source: { source: "local", path: fixture.marketplaceRoot }
+            }]
+          }),
+          stderr: ""
+        };
+      }
+      if (args[0] === "mcp" && args[1] === "get") {
+        const urls = effectiveUrls ? effectiveUrls() : readCodexFixtureUrls(fixture);
+        return {
+          stdout: JSON.stringify({
+            transport: {
+              url: urls.serverUrl,
+              http_headers: {
+                "X-Quick-Image-Plugin-Version": "0.2.1",
+                "X-Quick-Image-Frontend-URL": urls.frontendUrl
+              }
+            }
+          }),
+          stderr: ""
+        };
+      }
+      return { stdout: "[]", stderr: "" };
+    })
+  };
+}
+
+function readCodexFixtureUrls(fixture: CodexFixture): { serverUrl: string; frontendUrl: string } {
+  const manifest = JSON.parse(readFileSync(path.join(fixture.cacheRoot, ".mcp.json"), "utf8"));
+  const entry = manifest.mcpServers["quick-image"];
+  return { serverUrl: entry.url, frontendUrl: (entry.headers ?? {})["X-Quick-Image-Frontend-URL"] };
+}
+
+function defaultCodexMcpValue() {
+  return {
     mcpServers: {
       "quick-image": {
         type: "http",
-        url: "https://staging-api.example.com/mcp",
+        url: "https://quickimage.ai/mcp",
         headers: {
-          "X-Quick-Image-Plugin-Version": "0.1.0",
-          "X-Quick-Image-Frontend-URL": "https://staging.example.com"
+          "X-Quick-Image-Plugin-Version": "0.2.1",
+          "X-Quick-Image-Frontend-URL": "https://quickimage.ai"
         },
         http_headers: {
-          "X-Quick-Image-Plugin-Version": "0.1.0",
-          "X-Quick-Image-Frontend-URL": "https://staging.example.com"
+          "X-Quick-Image-Plugin-Version": "0.2.1",
+          "X-Quick-Image-Frontend-URL": "https://quickimage.ai"
         }
+      },
+      "quick-image-local": {
+        type: "stdio",
+        command: "npx",
+        args: ["--yes", "--package", "quick-image-agent-runtime@0.3.0", "quick-image-local-mcp"]
       }
     }
-  });
-  await Promise.all([
-    writeFile(path.join(root, ".mcp.json"), manifest),
-    writeFile(path.join(root, "mcp.json"), manifest)
-  ]);
+  };
 }

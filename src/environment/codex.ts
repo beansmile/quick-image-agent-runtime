@@ -1,4 +1,5 @@
-import { lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { lstat, readFile, stat } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { CommandExecutor } from "./command-executor.js";
@@ -8,59 +9,80 @@ import {
   QUICK_IMAGE_MCP_NAME,
   QUICK_IMAGE_PRODUCTION_FRONTEND_URL,
   QUICK_IMAGE_PRODUCTION_SERVER_URL,
-  QUICK_IMAGE_VERSION_HEADER,
   type EnvironmentStatus,
   type EnvironmentUrls
 } from "./config.js";
 import { resolveCodexExecutable } from "./executables.js";
+import { parseJsonManifestText, serializeJsonManifestText, writeJsonManifestAtomic } from "./json-manifest.js";
 
-export const MANAGED_BLOCK_BEGIN = "# BEGIN quick-image managed MCP environment";
-export const MANAGED_BLOCK_END = "# END quick-image managed MCP environment";
-const QUICK_IMAGE_TABLE_PATTERN = /^\s*\[\s*mcp_servers\s*\.\s*(?:quick-image|"quick-image"|'quick-image')\s*\]\s*(?:#.*)?$/m;
+// Codex 从插件安装目录的 MCP 清单加载 quick-image 远程配置（2026-09-23 实测：
+// 生效来源是 plugins/cache 安装缓存，.tmp/marketplaces 工作副本不直接生效、
+// 只作为缓存重建来源，两处都写以保持重建后一致）。环境切换因此与 WorkBuddy
+// 同机制：定位 Marketplace 工作副本与安装缓存两个根目录，同步改写各自的
+// MCP 清单（.codex-plugin/plugin.json 指向的 .mcp.json 与兼容布局 mcp.json），
+// 只更新 mcpServers.quick-image 的 url 与 X-Quick-Image-Frontend-URL 两个头，
+// 其余配置语义保持不变，并按原文还原 BOM、缩进、行尾与结尾换行；写入前备份，
+// 写入后回读校验，失败自动恢复原文，多清单时先整体规划再统一写入。
+// 不读写 ~/.codex/config.toml，也不处理其历史管理块残留：用户级配置若覆盖
+// 插件清单，写入后的生效校验会显式报错。
+const CODEX_BACKUP_SUFFIX = ".quick-image-backup";
+const HEADER_CONTAINERS = ["headers", "http_headers"] as const;
 
 interface CodexOptions {
-  runtimeVersion: string;
   codexBin?: string;
-  configPath?: string;
   executor?: CommandExecutor;
 }
 
+interface CodexRuntime {
+  codexBin: string;
+  executor: CommandExecutor;
+}
+
+interface CodexManifestUpdatePlan {
+  filePath: string;
+  originalText: string;
+  original: Record<string, unknown>;
+  updatedText: string;
+  mode: number;
+}
+
 export async function setCodexEnvironment(urls: EnvironmentUrls, options: CodexOptions): Promise<EnvironmentStatus> {
-  await restoreLegacyCodexManifests(options);
   const runtime = codexRuntime(options);
-  const source = await readCodexConfig(runtime.configPath);
-  const pluginVersion = readEffectiveCodexConfig(runtime)?.pluginVersion ?? options.runtimeVersion;
-  const updated = upsertCodexManagedBlock(source, urls, pluginVersion);
-  await writeCodexConfigAndVerify(runtime, source, updated, urls);
+  // 先完成两个根目录全部清单的解析与改写计算再统一写入：任何一份清单无法
+  // 解析时不会动任何文件；写入阶段中途失败时把已写入的清单回滚为原文，
+  // 避免不同根目录加载到混合环境。
+  const plans: CodexManifestUpdatePlan[] = [];
+  for (const root of resolvePluginRoots(runtime)) {
+    for (const filePath of await resolvePluginManifestFiles(root)) {
+      plans.push(await planCodexManifestUpdate(filePath, urls));
+    }
+  }
+  const committed: CodexManifestUpdatePlan[] = [];
+  try {
+    for (const plan of plans) {
+      await commitCodexManifestUpdate(plan, urls);
+      committed.push(plan);
+    }
+  } catch (error) {
+    // 回滚失败时保留各清单的备份文件供人工恢复，原始错误仍然如实上抛。
+    for (const plan of committed) {
+      await writeJsonManifestAtomic(plan.filePath, plan.originalText, plan.mode).catch(() => undefined);
+    }
+    throw error;
+  }
+  verifyCodexEffectiveConfig(runtime, urls);
   return readCodexEnvironmentStatus(options);
 }
 
 export async function resetCodexEnvironment(options: CodexOptions): Promise<EnvironmentStatus> {
-  const runtime = codexRuntime(options);
-  const source = await readCodexConfig(runtime.configPath);
-  const updated = removeCodexManagedBlock(source);
-  if (updated !== source) await writeCodexConfigAndVerify(runtime, source, updated);
-
-  let status = await readCodexEnvironmentStatus(options);
-  if (status.configured && (
-    status.serverUrl !== QUICK_IMAGE_PRODUCTION_SERVER_URL ||
-    status.frontendUrl !== QUICK_IMAGE_PRODUCTION_FRONTEND_URL
-  )) {
-    const repaired = await restoreLegacyCodexManifests(options);
-    if (repaired) status = await readCodexEnvironmentStatus(options);
-  }
-  if (status.configured && (
-    status.serverUrl !== QUICK_IMAGE_PRODUCTION_SERVER_URL ||
-    status.frontendUrl !== QUICK_IMAGE_PRODUCTION_FRONTEND_URL
-  )) {
-    throw new Error("Codex 当前仍由其他配置提供自定义 Quick Image URL，env reset 无法安全覆盖该配置");
-  }
-  return status;
+  return setCodexEnvironment({
+    serverUrl: QUICK_IMAGE_PRODUCTION_SERVER_URL,
+    frontendUrl: QUICK_IMAGE_PRODUCTION_FRONTEND_URL
+  }, options);
 }
 
 export async function readCodexEnvironmentStatus(options: CodexOptions): Promise<EnvironmentStatus> {
   const runtime = codexRuntime(options);
-  const source = await readCodexConfig(runtime.configPath);
   let output: string;
   try {
     output = runtime.executor.run(runtime.codexBin, ["mcp", "get", QUICK_IMAGE_MCP_NAME, "--json"]).stdout;
@@ -68,270 +90,138 @@ export async function readCodexEnvironmentStatus(options: CodexOptions): Promise
     return { host: "codex", configured: false, source: "missing" };
   }
   const config = parseCodexMcpOutput(JSON.parse(output));
+  const usesProduction = config.serverUrl === QUICK_IMAGE_PRODUCTION_SERVER_URL &&
+    config.frontendUrl === QUICK_IMAGE_PRODUCTION_FRONTEND_URL;
   return {
     host: "codex",
     configured: true,
-    source: containsManagedBlock(source)
-      ? "custom"
-      : config.serverUrl === QUICK_IMAGE_PRODUCTION_SERVER_URL &&
-          config.frontendUrl === QUICK_IMAGE_PRODUCTION_FRONTEND_URL
-        ? "plugin-default"
-        : "external",
+    source: usesProduction ? "plugin-default" : "custom",
     serverUrl: config.serverUrl,
     frontendUrl: config.frontendUrl,
     authenticationCommand: "codex mcp login quick-image"
   };
 }
 
-export function upsertCodexManagedBlock(
-  source: string,
-  urls: EnvironmentUrls,
-  runtimeVersion: string
-): string {
-  const prepared = prepareSourceForUpsert(source);
-  const block = renderManagedBlock(urls, runtimeVersion);
-  const range = (() => {
-    try { return managedBlockRange(prepared); } catch { return undefined; }
-  })();
-  if (range) return `${prepared.slice(0, range.start)}${block}${prepared.slice(range.end)}`;
-  const prefix = prepared.length === 0 ? "" : `${prepared.replace(/\s*$/, "")}\n\n`;
-  return `${prefix}${block}`;
-}
-
-export function removeCodexManagedBlock(source: string): string {
-  let range: { start: number; end: number } | undefined;
-  try {
-    range = managedBlockRange(source);
-  } catch (error) {
-    // 标记损坏：能按指纹识别出我们写入的表就救援删除，否则保持原样，
-    // 由 reset 的回落验证兜底报错。
-    return repairDamagedManagedSection(source) ?? source;
+function applyCodexManifestUrls(
+  manifest: Record<string, unknown>,
+  urls: EnvironmentUrls
+): Record<string, unknown> {
+  if (!isObject(manifest.mcpServers)) {
+    throw new Error("Codex MCP 清单缺少 quick-image 配置，请先重新安装 Quick Image Plugin");
   }
-  if (range) {
-    const separatorLength = source.slice(0, range.start).endsWith("\n\n") ? 1 : 0;
-    const before = source.slice(0, range.start - separatorLength);
-    const after = source.slice(range.end).replace(/^\n{2,}/, "\n");
-    return `${before}${after}`;
+  const servers = manifest.mcpServers;
+  const entry = servers[QUICK_IMAGE_MCP_NAME];
+  if (!isObject(entry) || Object.keys(entry).length === 0) {
+    throw new Error("Codex MCP 清单缺少 quick-image 配置，请先重新安装 Quick Image Plugin");
   }
-  return repairDamagedManagedSection(source) ?? source;
-}
-
-export function containsManagedBlock(source: string): boolean {
-  let marked = false;
-  try {
-    marked = managedBlockRange(source) !== undefined;
-  } catch {
-    // 标记损坏时按表体指纹判断，status 不因损坏而失败。
+  const updatedEntry: Record<string, unknown> = { ...entry, url: urls.serverUrl };
+  let touchedHeaderContainer = false;
+  for (const container of HEADER_CONTAINERS) {
+    const existing = updatedEntry[container];
+    if (!isObject(existing)) continue;
+    updatedEntry[container] = {
+      ...existing,
+      [QUICK_IMAGE_FRONTEND_HEADER]: urls.frontendUrl
+    };
+    touchedHeaderContainer = true;
   }
-  if (marked) return true;
-  const tableRange = quickImageTableRange(source);
-  return tableRange !== undefined && isManagedQuickImageTable(source, tableRange);
+  if (!touchedHeaderContainer) {
+    updatedEntry.headers = { [QUICK_IMAGE_FRONTEND_HEADER]: urls.frontendUrl };
+  }
+  return { ...manifest, mcpServers: { ...servers, [QUICK_IMAGE_MCP_NAME]: updatedEntry } };
 }
 
-// 标记行可能被其他工具或手工编辑破坏；我们写入的区块有稳定的内容指纹
-// （oauth_resource 行与 X-Quick-Image 头只会由 renderManagedBlock 同时产生），
-// 据此可以安全识别并清理损坏残留，避免用户陷入无法恢复正式环境的死角。
-// 指纹不匹配（更像用户手写配置）时返回 undefined，由调用方拒绝操作。
-function repairDamagedManagedSection(source: string): string | undefined {
-  const tableRange = quickImageTableRange(source);
-  if (tableRange === undefined || !isManagedQuickImageTable(source, tableRange)) return undefined;
-  const lines = source.split("\n");
-  const headerLine = lineIndexOf(source, tableRange.start);
-  // END 标记若残留在表体与下一个表头之间，会随表体一并删除；BEGIN 若还在，
-  // 只可能紧贴表头上方（允许隔着空行）且独占一行——我们只会这样写标记。
-  // 出现在别处或多行字符串内部的标记字样不属于本次写入的残留，保持原样。
-  let candidate = headerLine - 1;
-  while (candidate >= 0 && (lines[candidate] ?? "").trim() === "") candidate -= 1;
-  const removeStart = candidate >= 0 && (lines[candidate] ?? "").trim() === MANAGED_BLOCK_BEGIN
-    ? lines.slice(0, candidate).join("\n").length + (candidate > 0 ? 1 : 0)
-    : tableRange.start;
-  // 拼接处逐字节保留原有内容与空行；仅当删除发生在文件末尾时，才把遗留
-  // 的尾部空行收敛为一个换行。文件其他位置（包括多行字符串内部）不动。
-  const before = source.slice(0, removeStart);
-  const after = source.slice(tableRange.end);
-  return after === "" ? before.replace(/(?:[ \t]*\n)+$/, "\n") : `${before}${after}`;
-}
-
-function quickImageTableRange(source: string): { start: number; end: number } | undefined {
-  QUICK_IMAGE_TABLE_PATTERN.lastIndex = 0;
-  const match = QUICK_IMAGE_TABLE_PATTERN.exec(source);
-  if (!match || match.index === undefined) return undefined;
-  // pattern 的 ^\s* 可吞掉表头前的换行与空白，match.index 不一定指向 "["；
-  // 一切定位都基于 "[" 的真实位置，否则会把主表头误认成下一个表头。
-  const bracketOffset = match[0]?.indexOf("[") ?? -1;
-  if (bracketOffset < 0) return undefined;
-  const bracketIndex = match.index + bracketOffset;
-  const start = lineStart(source, bracketIndex);
-  const headerLineEnd = source.indexOf("\n", bracketIndex);
-  let searchFrom = headerLineEnd === -1 ? source.length : headerLineEnd + 1;
-  let end = source.length;
-  // 表体延伸到下一个顶格表头；http_headers 被第三方工具展开成
-  // [mcp_servers.quick-image.*] 子表时一并纳入，避免救援后留下孤儿配置。
-  for (;;) {
-    const rest = source.slice(searchFrom);
-    const nextHeader = /^\[/m.exec(rest);
-    if (!nextHeader || nextHeader.index === undefined) break;
-    const headerStart = searchFrom + nextHeader.index;
-    const lineBreak = source.indexOf("\n", headerStart);
-    const headerLine = source.slice(headerStart, lineBreak === -1 ? source.length : lineBreak);
-    if (!isQuickImageSubTableHeader(headerLine)) {
-      end = headerStart;
-      break;
+function verifyCodexManifest(
+  original: Record<string, unknown>,
+  rewritten: Record<string, unknown>,
+  urls: EnvironmentUrls
+): void {
+  if (Object.keys(original).sort().join("\u0000") !== Object.keys(rewritten).sort().join("\u0000")) {
+    throw new Error("Codex MCP 清单的顶层配置项被意外改动");
+  }
+  for (const key of Object.keys(original)) {
+    if (key === "mcpServers") continue;
+    if (JSON.stringify(original[key]) !== JSON.stringify(rewritten[key])) {
+      throw new Error("Codex MCP 清单中 mcpServers 以外的配置被意外改动");
     }
-    searchFrom = headerStart + 1;
   }
-  return { start, end };
-}
-
-function isQuickImageSubTableHeader(line: string): boolean {
-  return /^\[\s*mcp_servers\s*\.\s*(?:quick-image|"quick-image"|'quick-image')\s*\./.test(line);
-}
-
-function isManagedQuickImageTable(source: string, range: { start: number; end: number }): boolean {
-  // 指纹是两个带 Quick-Image 前缀的私有头：它们只会出现在指向 Quick Image
-  // 的自定义 MCP 配置中，同时出现即认定归属。刻意不依赖 oauth_resource 等
-  // Codex 通用契约键——表体被手改后它们可能缺失，不应因此放弃救援。
-  const body = source.slice(range.start, range.end);
-  return body.includes(QUICK_IMAGE_FRONTEND_HEADER) && body.includes(QUICK_IMAGE_VERSION_HEADER);
-}
-
-function prepareSourceForUpsert(source: string): string {
-  let range: { start: number; end: number } | undefined;
-  try {
-    range = managedBlockRange(source);
-  } catch (error) {
-    const repaired = repairDamagedManagedSection(source);
-    if (repaired === undefined) throw error;
-    return repaired;
+  const originalServers = isObject(original.mcpServers) ? original.mcpServers : {};
+  const rewrittenServers = isObject(rewritten.mcpServers) ? rewritten.mcpServers : {};
+  if (Object.keys(originalServers).sort().join("\u0000") !== Object.keys(rewrittenServers).sort().join("\u0000")) {
+    throw new Error("Codex MCP 清单的服务器列表被意外改动");
   }
-  if (range) return source;
-  if (QUICK_IMAGE_TABLE_PATTERN.test(source)) {
-    const tableRange = quickImageTableRange(source);
-    if (tableRange === undefined || !isManagedQuickImageTable(source, tableRange)) {
-      throw new Error("Codex config.toml 已包含非 Quick Image 管理的 mcp_servers.quick-image 配置；请先手工处理该冲突");
+  for (const name of Object.keys(originalServers)) {
+    if (name === QUICK_IMAGE_MCP_NAME) continue;
+    if (JSON.stringify(originalServers[name]) !== JSON.stringify(rewrittenServers[name])) {
+      throw new Error(`Codex MCP 清单中 ${name} 的配置被意外改动`);
     }
-    return repairDamagedManagedSection(source)!;
   }
-  return source;
-}
-
-function renderManagedBlock(urls: EnvironmentUrls, runtimeVersion: string): string {
-  return [
-    MANAGED_BLOCK_BEGIN,
-    `[mcp_servers.${QUICK_IMAGE_MCP_NAME}]`,
-    `url = ${tomlString(urls.serverUrl)}`,
-    `oauth_resource = ${tomlString(urls.serverUrl)}`,
-    'auth = "oauth"',
-    `http_headers = { ${tomlString(QUICK_IMAGE_VERSION_HEADER)} = ${tomlString(runtimeVersion)}, ${tomlString(QUICK_IMAGE_FRONTEND_HEADER)} = ${tomlString(urls.frontendUrl)} }`,
-    MANAGED_BLOCK_END,
-    ""
-  ].join("\n");
-}
-
-function managedBlockRange(source: string): { start: number; end: number } | undefined {
-  const begins = markerIndexes(source, MANAGED_BLOCK_BEGIN);
-  const ends = markerIndexes(source, MANAGED_BLOCK_END);
-  if (begins.length === 0 && ends.length === 0) return undefined;
-  if (begins.length !== 1 || ends.length !== 1 || begins[0] === undefined || ends[0] === undefined) {
-    throw new Error("Codex config.toml 中的 Quick Image 管理区块标记不完整或重复");
+  const entry = rewrittenServers[QUICK_IMAGE_MCP_NAME];
+  if (!isObject(entry) || entry.url !== urls.serverUrl) {
+    throw new Error("Codex MCP 清单回读校验失败：quick-image 条目未指向目标地址");
   }
-  if (begins[0] >= ends[0]) throw new Error("Codex config.toml 中的 Quick Image 管理区块顺序无效");
-  const start = lineStart(source, begins[0]);
-  const endLine = source.indexOf("\n", ends[0]);
-  return { start, end: endLine === -1 ? source.length : endLine + 1 };
-}
-
-function markerIndexes(source: string, marker: string): number[] {
-  const indexes: number[] = [];
-  let offset = 0;
-  while (offset < source.length) {
-    const index = source.indexOf(marker, offset);
-    if (index === -1) break;
-    indexes.push(index);
-    offset = index + marker.length;
+  const containers = HEADER_CONTAINERS.filter((container) => isObject(entry[container]));
+  if (containers.length === 0) {
+    throw new Error("Codex MCP 清单回读校验失败：quick-image 条目缺少前端地址头");
   }
-  return indexes;
-}
-
-function lineStart(source: string, index: number): number {
-  const previousNewline = source.lastIndexOf("\n", index - 1);
-  return previousNewline === -1 ? 0 : previousNewline + 1;
-}
-
-function lineIndexOf(source: string, charIndex: number): number {
-  let line = 0;
-  for (let index = 0; index < charIndex; index += 1) {
-    if (source[index] === "\n") line += 1;
+  for (const container of containers) {
+    const headers = entry[container];
+    if (!isObject(headers) || headers[QUICK_IMAGE_FRONTEND_HEADER] !== urls.frontendUrl) {
+      throw new Error("Codex MCP 清单回读校验失败：quick-image 条目的前端地址头与预期不一致");
+    }
   }
-  return line;
 }
 
-function tomlString(value: string): string {
-  return JSON.stringify(value);
-}
+async function planCodexManifestUpdate(filePath: string, urls: EnvironmentUrls): Promise<CodexManifestUpdatePlan> {
+  let details: Stats;
+  try {
+    details = await lstat(filePath);
+  } catch (error) {
+    if (isFileSystemError(error, "ENOENT")) throw new Error(`找不到 Codex MCP 清单：${filePath}`);
+    throw error;
+  }
+  if (details.isSymbolicLink()) throw new Error(`拒绝修改符号链接形式的 Codex MCP 清单：${filePath}`);
+  if (!details.isFile()) throw new Error(`Codex MCP 清单不是普通文件：${filePath}`);
 
-function codexRuntime(options: CodexOptions) {
+  const originalText = await readFile(filePath, "utf8");
+  const original = parseJsonManifestText(originalText, filePath);
+  const updated = applyCodexManifestUrls(original, urls);
+  const { mode } = await stat(filePath);
   return {
-    codexBin: resolveCodexExecutable(options.codexBin),
-    configPath: options.configPath ?? resolveCodexConfigPath(),
-    executor: options.executor ?? systemCommandExecutor
+    filePath,
+    originalText,
+    original,
+    updatedText: serializeJsonManifestText(updated, originalText),
+    mode
   };
 }
 
-// 旧版 Runtime 曾通过直接改写插件清单切换环境，Codex 重建缓存前该修改会残留。
-// 新版唯一的环境覆盖来源是上面的管理区块；这里把清单中遗留的非正式地址归位
-// 为与插件发布默认一致的正式地址，保证 env reset 能干净回落。仅允许写入正式
-// 默认值，任何失败都作为“未修复”返回而不阻断主流程。
-async function restoreLegacyCodexManifests(options: CodexOptions): Promise<boolean> {
+async function commitCodexManifestUpdate(plan: CodexManifestUpdatePlan, urls: EnvironmentUrls): Promise<void> {
+  if (plan.originalText !== "") {
+    await writeJsonManifestAtomic(`${plan.filePath}${CODEX_BACKUP_SUFFIX}`, plan.originalText, plan.mode);
+  }
+  await writeJsonManifestAtomic(plan.filePath, plan.updatedText, plan.mode);
   try {
-    const roots = await resolvePluginRoots(options);
-    let repaired = false;
-    for (const root of roots) {
-      for (const file of await resolvePluginManifestFiles(root)) {
-        const manifest = await readJsonFile(file);
-        if (!manifestNeedsRestore(manifest)) continue;
-        await writeJsonAtomic(file, restoreManifestToProduction(manifest));
-        repaired = true;
-      }
-    }
-    return repaired;
-  } catch {
-    return false;
+    const rewritten = parseJsonManifestText(await readFile(plan.filePath, "utf8"), plan.filePath);
+    verifyCodexManifest(plan.original, rewritten, urls);
+  } catch (error) {
+    await writeJsonManifestAtomic(plan.filePath, plan.originalText, plan.mode);
+    throw error;
   }
 }
 
-function manifestNeedsRestore(manifest: Record<string, unknown>): boolean {
-  const servers = isObject(manifest.mcpServers) ? manifest.mcpServers : {};
-  const current = isObject(servers[QUICK_IMAGE_MCP_NAME]) ? servers[QUICK_IMAGE_MCP_NAME] : {};
-  if (!isObject(current) || Object.keys(current).length === 0) return false;
-  const headers = isObject(current.headers) ? current.headers : {};
-  const httpHeaders = isObject(current.http_headers) ? current.http_headers : undefined;
-  return current.url !== QUICK_IMAGE_PRODUCTION_SERVER_URL ||
-    headers[QUICK_IMAGE_FRONTEND_HEADER] !== QUICK_IMAGE_PRODUCTION_FRONTEND_URL ||
-    (httpHeaders !== undefined && httpHeaders[QUICK_IMAGE_FRONTEND_HEADER] !== QUICK_IMAGE_PRODUCTION_FRONTEND_URL);
-}
-
-function restoreManifestToProduction(manifest: Record<string, unknown>): Record<string, unknown> {
-  const servers = isObject(manifest.mcpServers) ? { ...manifest.mcpServers } : {};
-  const current = isObject(servers[QUICK_IMAGE_MCP_NAME]) ? { ...servers[QUICK_IMAGE_MCP_NAME] } : {};
-  const restored: Record<string, unknown> = {
-    ...current,
-    url: QUICK_IMAGE_PRODUCTION_SERVER_URL
-  };
-  const headers = isObject(current.headers) ? { ...current.headers } : {};
-  headers[QUICK_IMAGE_FRONTEND_HEADER] = QUICK_IMAGE_PRODUCTION_FRONTEND_URL;
-  restored.headers = headers;
-  if (isObject(current.http_headers)) {
-    const httpHeaders = { ...current.http_headers };
-    httpHeaders[QUICK_IMAGE_FRONTEND_HEADER] = QUICK_IMAGE_PRODUCTION_FRONTEND_URL;
-    restored.http_headers = httpHeaders;
+function verifyCodexEffectiveConfig(runtime: CodexRuntime, urls: EnvironmentUrls): void {
+  // 清单已写入且回读校验通过；此处校验 Codex 实际加载的生效配置。用户级
+  // MCP 配置覆盖插件清单时如实报错而不是回滚清单——清单内容是正确的，
+  // 冲突来源在宿主配置。
+  const output = runtime.executor.run(runtime.codexBin, ["mcp", "get", QUICK_IMAGE_MCP_NAME, "--json"]);
+  const actual = parseCodexMcpOutput(JSON.parse(output.stdout));
+  if (actual.serverUrl !== urls.serverUrl || actual.frontendUrl !== urls.frontendUrl) {
+    throw new Error("Codex 未加载刚写入的 Quick Image MCP 配置；若存在用户级 MCP 配置，请先通过 codex mcp remove quick-image 移除后重试");
   }
-  servers[QUICK_IMAGE_MCP_NAME] = restored;
-  return { ...manifest, mcpServers: servers };
 }
 
-async function resolvePluginRoots(options: CodexOptions): Promise<string[]> {
-  const runtime = codexRuntime(options);
+function resolvePluginRoots(runtime: CodexRuntime): string[] {
   const output = runtime.executor.run(runtime.codexBin, ["plugin", "list", "--json"]).stdout;
   let value: unknown;
   try { value = JSON.parse(output); } catch { throw new Error("Codex Plugin 列表输出不是有效 JSON"); }
@@ -361,7 +251,11 @@ async function resolvePluginManifestFiles(root: string): Promise<string[]> {
   if (codexMcpPath !== resolvedRoot && !codexMcpPath.startsWith(`${resolvedRoot}${path.sep}`)) {
     throw new Error(`Codex MCP 清单路径超出 Plugin 目录：${pluginManifest.mcpServers}`);
   }
-  return [...new Set([codexMcpPath, path.join(root, "mcp.json")])];
+  // mcp.json 是兼容布局候选，旧安装可能没有：缺失时跳过而不是让切换失败。
+  const legacyPath = path.join(root, "mcp.json");
+  const files = [codexMcpPath];
+  if (path.resolve(legacyPath) !== codexMcpPath && await fileExists(legacyPath)) files.push(legacyPath);
+  return files;
 }
 
 function safePluginPathSegment(value: string, label: string): string {
@@ -374,29 +268,26 @@ function safePluginPathSegment(value: string, label: string): string {
 async function readJsonFile(filePath: string): Promise<Record<string, unknown>> {
   try { return JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>; }
   catch (error) {
-    if (isFileSystemError(error, "ENOENT")) throw new Error(`找不到 Codex MCP 清单：${filePath}`);
-    throw new Error(`无法读取 Codex MCP 清单：${filePath}`);
+    if (isFileSystemError(error, "ENOENT")) throw new Error(`找不到 Codex 插件清单：${filePath}`);
+    throw new Error(`无法读取 Codex 插件清单：${filePath}`);
   }
 }
 
-async function writeJsonAtomic(filePath: string, value: Record<string, unknown>): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  const temporaryPath = `${filePath}.quick-image-${process.pid}.tmp`;
-  await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  await rename(temporaryPath, filePath);
-}
-
-function readEffectiveCodexConfig(runtime: ReturnType<typeof codexRuntime>): CodexMcpConfig | undefined {
+async function fileExists(filePath: string): Promise<boolean> {
   try {
-    const output = runtime.executor.run(runtime.codexBin, ["mcp", "get", QUICK_IMAGE_MCP_NAME, "--json"]);
-    return parseCodexMcpOutput(JSON.parse(output.stdout));
-  } catch {
-    return undefined;
+    await stat(filePath);
+    return true;
+  } catch (error) {
+    if (isFileSystemError(error, "ENOENT")) return false;
+    throw error;
   }
 }
 
-function resolveCodexConfigPath(): string {
-  return path.join(resolveCodexHome(), "config.toml");
+function codexRuntime(options: CodexOptions): CodexRuntime {
+  return {
+    codexBin: resolveCodexExecutable(options.codexBin),
+    executor: options.executor ?? systemCommandExecutor
+  };
 }
 
 function resolveCodexHome(): string {
@@ -404,67 +295,7 @@ function resolveCodexHome(): string {
   return codexHome ? path.resolve(codexHome) : path.join(os.homedir(), ".codex");
 }
 
-async function readCodexConfig(configPath: string): Promise<string> {
-  try {
-    const details = await lstat(configPath);
-    if (details.isSymbolicLink()) throw new Error(`拒绝修改符号链接形式的 Codex 配置：${configPath}`);
-    if (!details.isFile()) throw new Error(`Codex 配置不是普通文件：${configPath}`);
-    return await readFile(configPath, "utf8");
-  } catch (error) {
-    if (isFileSystemError(error, "ENOENT")) return "";
-    throw error;
-  }
-}
-
-async function writeCodexConfigAndVerify(
-  runtime: ReturnType<typeof codexRuntime>,
-  original: string,
-  updated: string,
-  expected?: EnvironmentUrls
-): Promise<void> {
-  if (original !== "") {
-    await writeAtomic(`${runtime.configPath}.quick-image-backup`, original);
-  }
-  await writeAtomic(runtime.configPath, updated);
-  try {
-    runtime.executor.run(runtime.codexBin, ["mcp", "list", "--json"]);
-    if (expected) {
-      const output = runtime.executor.run(runtime.codexBin, ["mcp", "get", QUICK_IMAGE_MCP_NAME, "--json"]);
-      const actual = parseCodexMcpOutput(JSON.parse(output.stdout));
-      if (actual.serverUrl !== expected.serverUrl || actual.frontendUrl !== expected.frontendUrl) {
-        throw new Error("Codex 未加载刚写入的 Quick Image MCP 配置");
-      }
-    }
-  } catch (error) {
-    await restoreCodexConfig(runtime.configPath, original);
-    throw error;
-  }
-}
-
-async function writeAtomic(filePath: string, content: string): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  const temporaryPath = `${filePath}.quick-image-${process.pid}.tmp`;
-  await writeFile(temporaryPath, content, { mode: 0o600 });
-  await rename(temporaryPath, filePath);
-}
-
-async function restoreCodexConfig(filePath: string, original: string): Promise<void> {
-  if (original === "") {
-    try {
-      await unlink(filePath);
-    } catch (error) {
-      if (!isFileSystemError(error, "ENOENT")) throw error;
-    }
-    return;
-  }
-  await writeAtomic(filePath, original);
-}
-
-interface CodexMcpConfig extends EnvironmentUrls {
-  pluginVersion?: string;
-}
-
-function parseCodexMcpOutput(value: unknown): CodexMcpConfig {
+function parseCodexMcpOutput(value: unknown): EnvironmentUrls {
   if (!isObject(value) || !isObject(value.transport)) throw new Error("Codex MCP 状态输出无效");
   const headers = isObject(value.transport.http_headers) ? value.transport.http_headers : {};
   const serverUrl = value.transport.url;
@@ -472,12 +303,7 @@ function parseCodexMcpOutput(value: unknown): CodexMcpConfig {
   if (typeof serverUrl !== "string" || typeof frontendUrl !== "string") {
     throw new Error("Codex Quick Image MCP 缺少 Server URL 或 Frontend URL");
   }
-  const pluginVersion = headers[QUICK_IMAGE_VERSION_HEADER];
-  return {
-    serverUrl,
-    frontendUrl,
-    ...(typeof pluginVersion === "string" ? { pluginVersion } : {})
-  };
+  return { serverUrl, frontendUrl };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

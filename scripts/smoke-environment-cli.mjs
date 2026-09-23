@@ -4,7 +4,6 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 const root = await mkdtemp(path.join(os.tmpdir(), "quick-image-env-cli-smoke-"));
-const codexBin = path.join(root, "codex-fixture.mjs");
 const codexHome = path.join(root, ".codex");
 const codexConfigPath = path.join(codexHome, "config.toml");
 const openClawBin = path.join(root, "openclaw-fixture.mjs");
@@ -14,15 +13,60 @@ const originalCodexConfig = 'model = "gpt-test"\n';
 try {
   await mkdir(codexHome, { recursive: true });
   await writeFile(codexConfigPath, originalCodexConfig);
+
+  const marketplaceRoot = path.join(codexHome, ".tmp", "marketplaces", "quick-image");
+  const cacheRoot = path.join(codexHome, "plugins", "cache", "quick-image", "quick-image", "0.2.1");
+  const codexManifestPaths = [];
+  for (const pluginRoot of [marketplaceRoot, cacheRoot]) {
+    await mkdir(path.join(pluginRoot, ".codex-plugin"), { recursive: true });
+    await writeFile(path.join(pluginRoot, ".codex-plugin", "plugin.json"), JSON.stringify({
+      name: "quick-image",
+      version: "0.2.1",
+      mcpServers: "./.mcp.json"
+    }));
+    for (const fileName of [".mcp.json", "mcp.json"]) codexManifestPaths.push(path.join(pluginRoot, fileName));
+  }
+  const originalCodexManifest = `${JSON.stringify({
+    mcpServers: {
+      "quick-image": {
+        type: "http",
+        url: "https://quickimage.ai/mcp",
+        headers: {
+          "X-Quick-Image-Plugin-Version": "0.2.1",
+          "X-Quick-Image-Frontend-URL": "https://quickimage.ai"
+        },
+        http_headers: {
+          "X-Quick-Image-Plugin-Version": "0.2.1",
+          "X-Quick-Image-Frontend-URL": "https://quickimage.ai"
+        }
+      }
+    }
+  }, null, 2)}\n`;
+  await Promise.all(codexManifestPaths.map((manifestPath) => writeFile(manifestPath, originalCodexManifest)));
+
+  const codexBin = path.join(root, "codex-fixture.mjs");
   await writeFile(codexBin, [
     "#!/usr/bin/env node",
+    "const fs = await import('node:fs');",
+    "const path = await import('node:path');",
     "const args = process.argv.slice(2);",
-    "if (args[0] === 'mcp' && args[1] === 'get') {",
+    "const cacheManifest = path.join(process.env.CODEX_HOME, 'plugins', 'cache', 'quick-image', 'quick-image', '0.2.1', '.mcp.json');",
+    "if (args[0] === 'plugin' && args[1] === 'list') {",
+    "  process.stdout.write(JSON.stringify({ installed: [{",
+    "    pluginId: 'quick-image@quick-image',",
+    "    name: 'quick-image',",
+    "    marketplaceName: 'quick-image',",
+    "    version: '0.2.1',",
+    "    enabled: true,",
+    "    source: { source: 'local', path: path.join(process.env.CODEX_HOME, '.tmp', 'marketplaces', 'quick-image') }",
+    "  }] }));",
+    "} else if (args[0] === 'mcp' && args[1] === 'get') {",
+    "  const entry = JSON.parse(fs.readFileSync(cacheManifest, 'utf8')).mcpServers['quick-image'];",
     "  process.stdout.write(JSON.stringify({ transport: {",
-    "    url: 'https://staging-api.example.com/mcp',",
+    "    url: entry.url,",
     "    http_headers: {",
-    "      'X-Quick-Image-Plugin-Version': '0.1.0',",
-    "      'X-Quick-Image-Frontend-URL': 'https://staging.example.com'",
+    "      'X-Quick-Image-Plugin-Version': '0.2.1',",
+    "      'X-Quick-Image-Frontend-URL': entry.headers['X-Quick-Image-Frontend-URL']",
     "    }",
     "  } }));",
     "} else {",
@@ -49,34 +93,20 @@ try {
   if (result.status !== 0) {
     throw new Error(`environment CLI failed: ${(result.stderr || result.stdout).trim()}`);
   }
-  const updatedCodexConfig = await readFile(codexConfigPath, "utf8");
-  if (!updatedCodexConfig.includes("BEGIN quick-image managed MCP environment") ||
-      !updatedCodexConfig.includes('url = "https://staging-api.example.com/mcp"') ||
-      !updatedCodexConfig.includes('model = "gpt-test"')) {
-    throw new Error("environment CLI did not append the managed Quick Image block to Codex config.toml");
+  for (const manifestPath of codexManifestPaths) {
+    const updated = JSON.parse(await readFile(manifestPath, "utf8"));
+    if (updated.mcpServers["quick-image"].url !== "https://staging-api.example.com/mcp" ||
+        updated.mcpServers["quick-image"].headers?.["X-Quick-Image-Frontend-URL"] !== "https://staging.example.com") {
+      throw new Error(`environment CLI did not update the Codex plugin manifest: ${manifestPath}`);
+    }
+    if (await readFile(`${manifestPath}.quick-image-backup`, "utf8").then((content) => content !== originalCodexManifest).catch(() => true)) {
+      throw new Error(`environment CLI did not back up the Codex plugin manifest: ${manifestPath}`);
+    }
   }
-  if (await readFile(`${codexConfigPath}.quick-image-backup`, "utf8").then((content) => content !== originalCodexConfig).catch(() => true)) {
-    throw new Error("environment CLI did not back up Codex config.toml before writing");
+  if (await readFile(codexConfigPath, "utf8").then((content) => content !== originalCodexConfig).catch(() => true)) {
+    throw new Error("environment CLI unexpectedly modified Codex config.toml");
   }
 
-  const resetBin = path.join(root, "codex-reset-fixture.mjs");
-  await writeFile(resetBin, [
-    "#!/usr/bin/env node",
-    "const args = process.argv.slice(2);",
-    "if (args[0] === 'mcp' && args[1] === 'get') {",
-    "  process.stdout.write(JSON.stringify({ transport: {",
-    "    url: 'https://quickimage.ai/mcp',",
-    "    http_headers: {",
-    "      'X-Quick-Image-Plugin-Version': '0.1.0',",
-    "      'X-Quick-Image-Frontend-URL': 'https://quickimage.ai'",
-    "    }",
-    "  } }));",
-    "} else {",
-    "  process.stdout.write('[]');",
-    "}",
-    ""
-  ].join("\n"), { mode: 0o700 });
-  await chmod(resetBin, 0o700);
   const resetResult = spawnSync(process.execPath, [
     path.join(process.cwd(), "dist", "cli", "quick-image.js"),
     "env",
@@ -84,13 +114,17 @@ try {
     "--host",
     "codex",
     "--codex-bin",
-    resetBin
+    codexBin
   ], { encoding: "utf8", env: { ...process.env, CODEX_HOME: codexHome } });
   if (resetResult.status !== 0) {
     throw new Error(`environment reset CLI failed: ${(resetResult.stderr || resetResult.stdout).trim()}`);
   }
-  if (await readFile(codexConfigPath, "utf8").then((content) => content !== originalCodexConfig)) {
-    throw new Error("environment reset CLI did not restore the original Codex config.toml");
+  for (const manifestPath of codexManifestPaths) {
+    const restored = JSON.parse(await readFile(manifestPath, "utf8"));
+    if (restored.mcpServers["quick-image"].url !== "https://quickimage.ai/mcp" ||
+        restored.mcpServers["quick-image"].headers?.["X-Quick-Image-Frontend-URL"] !== "https://quickimage.ai") {
+      throw new Error(`environment reset CLI did not restore the Codex plugin manifest: ${manifestPath}`);
+    }
   }
 
   await writeFile(openClawBin, [
