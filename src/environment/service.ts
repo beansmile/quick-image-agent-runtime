@@ -39,7 +39,6 @@ export async function executeEnvironmentCommand(options: EnvironmentCommandOptio
 
   if (options.host === "codex") {
     const codexOptions = {
-      runtimeVersion: options.runtimeVersion,
       ...(options.codexBin ? { codexBin: options.codexBin } : {}),
     };
     return [options.action === "set"

@@ -1,6 +1,6 @@
 {
   "name": "quick-image-agent-runtime",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Quick Image local processing runtime for agent hosts",
   "type": "module",
   "license": "LicenseRef-Quick-Image",
