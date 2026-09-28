@@ -1,4 +1,4 @@
-import { lstat, readFile, stat } from "node:fs/promises";
+import { lstat, readFile, readdir, stat } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -29,14 +29,22 @@ export { serializeJsonManifestText as serializeWorkBuddyManifestText } from "./j
 // 还原 BOM、缩进、行尾与结尾换行；写入前备份，写入后回读校验，失败
 // 自动恢复原文，多安装多清单时先整体规划再统一写入。
 // 插件缓存以 installed_plugins.json 为权威注册表，孤儿目录（带 .orphaned_at）
-// 不会出现在其中，避免误改已废弃的安装。
+// 不会出现在其中，避免误改已废弃的安装。WorkBuddy 是 Windows 桌面应用，插件
+// 只装在 Windows 侧；当本 CLI 在 WSL 中运行时，默认 home（Linux 侧）解析不到
+// 安装，会自动回退到 /mnt/c/Users/*/.workbuddy（注册表中的 Windows installPath
+// 一并映射为挂载路径）。显式指定的 home 不参与回退。
 const WORKBUDDY_MANIFEST_CANDIDATES = [".workbuddy-plugin/plugin.json", ".codebuddy-plugin/plugin.json"] as const;
 const WORKBUDDY_REGISTRY_RELATIVE_PATH = path.join("plugins", "installed_plugins.json");
 const WORKBUDDY_BACKUP_SUFFIX = ".quick-image-backup";
 const HEADER_CONTAINERS = ["headers", "http_headers"] as const;
+const WORKBUDDY_WSL_USERS_DIRECTORY = "/mnt/c/Users";
+// Windows 用户目录下的系统内置目录不是真实用户，回退时跳过。
+const WORKBUDDY_WSL_SYSTEM_USER_DIRECTORIES = new Set(["Public", "Default", "Default User", "All Users"]);
 
 export interface WorkBuddyOptions {
   workbuddyHome?: string;
+  /** 覆盖回退时扫描的 Windows 用户目录挂载位置，仅测试注入用。 */
+  wslUsersDirectory?: string;
 }
 
 interface WorkBuddyInstall {
@@ -53,9 +61,12 @@ interface WorkBuddyMcpUpdatePlan {
 }
 
 export async function setWorkBuddyEnvironment(urls: EnvironmentUrls, options: WorkBuddyOptions): Promise<EnvironmentStatus> {
-  const installs = await resolveWorkBuddyInstalls(resolveWorkBuddyHome(options.workbuddyHome));
+  const installs = await resolveWorkBuddyInstallsFromCandidates(options);
   if (installs.length === 0) {
-    throw new Error("在 WorkBuddy 中找不到 quick-image 插件安装，请先在 WorkBuddy 中安装 Quick Image Plugin");
+    throw new Error(
+      "在 WorkBuddy 中找不到 quick-image 插件安装，请先在 WorkBuddy 中安装 Quick Image Plugin；" +
+      "若本命令在 WSL 中运行，请改在 Windows 终端中运行，或设置 WORKBUDDY_HOME 指向 Windows 侧的 .workbuddy 目录"
+    );
   }
   // 多个安装（不同 scope）先全部完成解析与改写计算，再统一写入：任何一个安装
   // 的任何一份清单无法解析时不会动任何文件；写入阶段中途失败时把已写入的清单
@@ -98,7 +109,7 @@ export async function readWorkBuddyEnvironmentStatus(options: WorkBuddyOptions):
   // 与下方对 .mcp.json 损坏的处理一致；set/reset 仍会对这些问题显式报错。
   let installs: WorkBuddyInstall[];
   try {
-    installs = await resolveWorkBuddyInstalls(resolveWorkBuddyHome(options.workbuddyHome));
+    installs = await resolveWorkBuddyInstallsFromCandidates(options);
   } catch {
     return { host: "workbuddy", configured: false, source: "missing" };
   }
@@ -199,7 +210,7 @@ export function verifyWorkBuddyManifest(
   }
 }
 
-async function resolveWorkBuddyInstalls(home: string): Promise<WorkBuddyInstall[]> {
+async function resolveWorkBuddyInstalls(home: string, wslMountRoot = "/mnt"): Promise<WorkBuddyInstall[]> {
   const registry = await readOptionalJson(path.join(home, WORKBUDDY_REGISTRY_RELATIVE_PATH));
   if (!registry || !isObject(registry.plugins)) return [];
   const roots: string[] = [];
@@ -207,7 +218,7 @@ async function resolveWorkBuddyInstalls(home: string): Promise<WorkBuddyInstall[
     if (!workBuddyPluginKeyMatches(key) || !Array.isArray(entries)) continue;
     for (const entry of entries) {
       if (!isObject(entry) || typeof entry.installPath !== "string") continue;
-      const root = path.resolve(entry.installPath);
+      const root = path.resolve(normalizeWorkBuddyInstallPath(entry.installPath, wslMountRoot));
       if (!roots.some((existing) => samePath(existing, root))) roots.push(root);
     }
   }
@@ -217,6 +228,59 @@ async function resolveWorkBuddyInstalls(home: string): Promise<WorkBuddyInstall[
     if (mcpPaths.length > 0) installs.push({ root, mcpPaths });
   }
   return installs;
+}
+
+// 解析顺序：显式指定的 home（CLI 参数或 WORKBUDDY_HOME，二者语义相同，严格
+// 使用不回退）→ 默认 home → WSL 挂载的 Windows 用户目录。回退只在默认 home
+// 一个安装都解析不出、且运行在类 Unix 系统上时发生；取第一个能解析出安装的
+// 回退 home，避免同时改写多个 Windows 用户的安装。回退候选解析失败（注册表
+// 损坏等）时跳过换下一个候选，主 home 的错误仍如实上抛。
+async function resolveWorkBuddyInstallsFromCandidates(options: WorkBuddyOptions): Promise<WorkBuddyInstall[]> {
+  const explicitHome = options.workbuddyHome?.trim() || process.env.WORKBUDDY_HOME?.trim() || "";
+  if (explicitHome) return resolveWorkBuddyInstalls(path.resolve(explicitHome));
+  const primaryInstalls = await resolveWorkBuddyInstalls(resolveWorkBuddyHome());
+  if (primaryInstalls.length > 0 || process.platform === "win32") return primaryInstalls;
+  const mountRoot = wslMountRoot(options.wslUsersDirectory);
+  for (const home of await wslWorkBuddyHomeCandidates(options.wslUsersDirectory)) {
+    const installs = await resolveWorkBuddyInstalls(home, mountRoot).catch(() => []);
+    if (installs.length > 0) return installs;
+  }
+  return primaryInstalls;
+}
+
+// WSL 默认把 Windows 盘符挂载在 /mnt/<盘符>，WorkBuddy 的 home 在用户目录下。
+// 只收集真实存在 .workbuddy 目录的用户；挂载目录不存在（非 WSL 的类 Unix
+// 系统）时返回空列表，行为与回退前一致。
+async function wslWorkBuddyHomeCandidates(usersDirectory?: string): Promise<string[]> {
+  const root = usersDirectory?.trim() || WORKBUDDY_WSL_USERS_DIRECTORY;
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => undefined);
+  if (!entries) return [];
+  const homes: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || WORKBUDDY_WSL_SYSTEM_USER_DIRECTORIES.has(entry.name)) continue;
+    const home = path.join(root, entry.name, ".workbuddy");
+    const details = await stat(home).catch(() => undefined);
+    if (details?.isDirectory()) homes.push(home);
+  }
+  return homes;
+}
+
+// WSL 回退读到的注册表由 Windows 侧 WorkBuddy 写入，installPath 是 Windows
+// 路径（C:\Users\...）；类 Unix 系统上映射为对应挂载点，POSIX 路径与
+// Windows 原生运行保持原样。
+export function normalizeWorkBuddyInstallPath(installPath: string, mountRoot = "/mnt"): string {
+  if (process.platform === "win32") return installPath;
+  const match = /^([A-Za-z]):[\\/](.*)$/.exec(installPath.trim());
+  if (!match) return installPath;
+  return `${mountRoot}/${match[1]!.toLowerCase()}/${match[2]!.split(/[\\/]+/).filter(Boolean).join("/")}`;
+}
+
+// usersDirectory 形如 <挂载根>/<盘符>/Users（默认 /mnt/c/Users），挂载根取其
+// 上两级，使注册表中的 Windows installPath 与回退候选落在同一挂载位置。
+function wslMountRoot(usersDirectory?: string): string {
+  const configured = usersDirectory?.trim();
+  if (!configured) return "/mnt";
+  return path.dirname(path.dirname(path.resolve(configured)));
 }
 
 // 注册表键形如 <plugin>@<marketplace>，按最后一个 @ 分隔取插件名。
