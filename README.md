@@ -48,7 +48,7 @@ quick-image env status --host <codex|openclaw|workbuddy>
 quick-image env reset --host <codex|openclaw|workbuddy>
 ```
 
-完整执行时，上述两条命令同样需要加上 `npx --yes --prefer-online --package quick-image-agent-runtime@latest` 前缀。命令只改写 quick-image 自身的 MCP 配置：写入前自动备份、写入后校验、失败自动恢复，不影响宿主的其他配置。切换地址不会迁移 OAuth 凭据，完成后需重新授权 quick-image MCP：Codex 执行 `codex mcp login quick-image` 并新建任务加载配置；WorkBuddy 完全退出并重新打开后重新授权；OpenClaw 执行 `openclaw mcp login quick-image`，配置即时生效。WorkBuddy 主目录不在默认位置时可用 `WORKBUDDY_HOME` 环境变量指定；同版本号重装 WorkBuddy 插件不会还原配置，恢复正式环境需执行 `env reset`。Codex 插件更新或重装会把清单还原为插件默认的正式地址，需要时重新执行 `env set`。
+完整执行时，上述两条命令同样需要加上 `npx --yes --prefer-online --package quick-image-agent-runtime@latest` 前缀。命令只改写 quick-image 自身的 MCP 配置：写入前自动备份、写入后校验、失败自动恢复，不影响宿主的其他配置。切换地址不会迁移 OAuth 凭据，完成后需重新授权 quick-image MCP：Codex 执行 `codex mcp login quick-image` 并新建任务加载配置；WorkBuddy 完全退出并重新打开后重新授权；OpenClaw 执行 `openclaw mcp login quick-image`，配置即时生效。WorkBuddy 主目录不在默认位置时可用 `WORKBUDDY_HOME` 环境变量指定；在 WSL 中执行 WorkBuddy 环境切换时，若 Linux 侧没有安装，会自动回退到 `/mnt/c/Users/*/.workbuddy`（Windows 侧用户目录）；同版本号重装 WorkBuddy 插件不会还原配置，恢复正式环境需执行 `env reset`。Codex 插件更新或重装会把清单还原为插件默认的正式地址，需要时重新执行 `env set`。
 
 ## 本地开发
 

@@ -19,6 +19,7 @@ import {
 import { setOpenClawEnvironment } from "../src/environment/openclaw.js";
 import {
   applyWorkBuddyMcpUrls,
+  normalizeWorkBuddyInstallPath,
   resetWorkBuddyEnvironment,
   readWorkBuddyEnvironmentStatus,
   serializeWorkBuddyManifestText,
@@ -556,6 +557,86 @@ describe("WorkBuddy environment adapter", () => {
       .toBe(`{\n\t"mcpServers": {}\n}\n`);
     expect(serializeWorkBuddyManifestText(value, '{"mcpServers":{}}\n')).toBe('{"mcpServers":{}}\n');
   });
+
+  // 以下用例模拟在 WSL 中运行：homedir 指向无安装的 Linux 侧 home，Windows
+  // 侧的用户目录通过 wslUsersDirectory 注入到临时目录。
+  it("falls back to the Windows-side home when the default home has no installs", async () => {
+    const directory = await temporaryDirectory();
+    vi.stubEnv("WORKBUDDY_HOME", "");
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(directory);
+    try {
+      const usersRoot = path.join(directory, "mnt", "c", "Users");
+      // Public 是系统目录，即使带有安装也必须被回退逻辑跳过。
+      const publicFixture = await writeWorkBuddyFixture(path.join(usersRoot, "Public", ".workbuddy"), {});
+      const windowsHome = path.join(usersRoot, "chen", ".workbuddy");
+      const fixture = await writeWorkBuddyFixture(windowsHome, {
+        installPathSuffix: "0.2.2",
+        installPath: "C:\\Users\\chen\\.workbuddy\\plugins\\cache\\quick-image\\quick-image\\0.2.2"
+      });
+
+      const status = await setWorkBuddyEnvironment(stagingUrls, { wslUsersDirectory: usersRoot });
+      expect(status.serverUrl).toBe(stagingUrls.serverUrl);
+      const rewritten = JSON.parse(await readFile(fixture.mcpPaths[0]!, "utf8"));
+      expect(rewritten.mcpServers["quick-image"].url).toBe(stagingUrls.serverUrl);
+      await expect(readFile(publicFixture.mcpPaths[0]!, "utf8")).resolves.toBe(publicFixture.originalText);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  it("also reads the Windows-side configuration through the fallback in status", async () => {
+    const directory = await temporaryDirectory();
+    vi.stubEnv("WORKBUDDY_HOME", "");
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(directory);
+    try {
+      const usersRoot = path.join(directory, "mnt", "c", "Users");
+      await writeWorkBuddyFixture(path.join(usersRoot, "chen", ".workbuddy"), {});
+      await expect(readWorkBuddyEnvironmentStatus({ wslUsersDirectory: usersRoot }))
+        .resolves.toMatchObject({ host: "workbuddy", configured: true });
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  it("prefers installs in the default home over WSL candidates", async () => {
+    const directory = await temporaryDirectory();
+    vi.stubEnv("WORKBUDDY_HOME", "");
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(path.join(directory, "linux-side"));
+    try {
+      const localFixture = await writeWorkBuddyFixture(path.join(directory, "linux-side", ".workbuddy"), {});
+      const usersRoot = path.join(directory, "mnt", "c", "Users");
+      const windowsFixture = await writeWorkBuddyFixture(path.join(usersRoot, "chen", ".workbuddy"), {});
+
+      const status = await setWorkBuddyEnvironment(stagingUrls, { wslUsersDirectory: usersRoot });
+      expect(status.serverUrl).toBe(stagingUrls.serverUrl);
+      const rewritten = JSON.parse(await readFile(localFixture.mcpPaths[0]!, "utf8"));
+      expect(rewritten.mcpServers["quick-image"].url).toBe(stagingUrls.serverUrl);
+      await expect(readFile(windowsFixture.mcpPaths[0]!, "utf8")).resolves.toBe(windowsFixture.originalText);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+
+  it("keeps an explicitly configured home strict and mentions WSL in the error", async () => {
+    const directory = await temporaryDirectory();
+    const usersRoot = path.join(directory, "mnt", "c", "Users");
+    await writeWorkBuddyFixture(path.join(usersRoot, "chen", ".workbuddy"), {});
+
+    await expect(setWorkBuddyEnvironment(stagingUrls, {
+      workbuddyHome: path.join(directory, "empty"),
+      wslUsersDirectory: usersRoot
+    })).rejects.toThrow(/WSL/);
+  });
+
+  it("maps Windows install paths onto the WSL mount root", () => {
+    // 用例运行在 macOS/Linux 上；win32 分支不转换，由 Windows 原生行为保证。
+    expect(normalizeWorkBuddyInstallPath("C:\\Users\\chen\\.workbuddy\\plugins\\cache", "/mnt"))
+      .toBe("/mnt/c/Users/chen/.workbuddy/plugins/cache");
+    expect(normalizeWorkBuddyInstallPath("D:/Users/chen/.workbuddy", "/mnt"))
+      .toBe("/mnt/d/Users/chen/.workbuddy");
+    expect(normalizeWorkBuddyInstallPath("/home/chen/.workbuddy", "/mnt"))
+      .toBe("/home/chen/.workbuddy");
+  });
 });
 
 async function temporaryDirectory(): Promise<string> {
@@ -577,6 +658,8 @@ interface WorkBuddyFixtureOptions {
   manifestContent?: string;
   registryKey?: string;
   installPathSuffix?: string;
+  /** 覆盖注册表条目的 installPath，用于模拟 Windows 侧 WorkBuddy 写入的注册表。 */
+  installPath?: string;
   byteOrderMark?: boolean;
   trailingNewline?: boolean;
 }
@@ -610,7 +693,7 @@ async function writeWorkBuddyFixture(home: string, options: WorkBuddyFixtureOpti
     plugins: {
       [registryKey]: [{
         scope: "user",
-        installPath: root,
+        installPath: options.installPath ?? root,
         version: "0.1.8",
         installedAt: "2026-09-21T15:19:54.090Z",
         lastUpdated: "2026-09-21T15:19:54.090Z"
