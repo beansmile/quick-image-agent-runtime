@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { LookupFunction } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { UploadTargetPolicy } from "../src/security/upload-target.js";
 import { directUploadSchema } from "../src/contracts/local-tool-schemas.js";
@@ -42,8 +41,7 @@ describe("UploadStagedAttachmentService", () => {
       checksum: `sha256:${createHash("sha256").update(buffer).digest("hex")}`,
       expires_at: new Date(Date.now() + 60_000).toISOString()
     });
-    const lookup = (() => undefined) as unknown as LookupFunction;
-    const policy: UploadTargetPolicy = { assertUrl: (value) => new URL(value), lookup };
+    const policy: UploadTargetPolicy = { assertUrl: (value) => new URL(value) };
     const uploader = vi.fn(async (_url, headers: Record<string, string>, body: Buffer) => {
       expect(headers["content-length"]).toBe(String(buffer.length));
       expect(body.equals(buffer)).toBe(true);
@@ -76,8 +74,7 @@ describe("UploadStagedAttachmentService", () => {
       checksum: `sha256:${createHash("sha256").update(buffer).digest("hex")}`,
       expires_at: new Date(Date.now() + 60_000).toISOString()
     });
-    const lookup = (() => undefined) as unknown as LookupFunction;
-    const policy: UploadTargetPolicy = { assertUrl: vi.fn(), lookup };
+    const policy: UploadTargetPolicy = { assertUrl: vi.fn() };
     const uploader = vi.fn();
     const service = new UploadStagedAttachmentService(store, policy, uploader);
     const directUpload = {
