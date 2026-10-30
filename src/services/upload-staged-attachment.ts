@@ -39,7 +39,7 @@ export class UploadStagedAttachmentService {
       if (directUpload.upload_required === false) return { asset_id: directUpload.asset_id };
 
       const headers = validateHeaders(directUpload.headers, record.size, record.content_type);
-      await this.uploader(uploadUrl!, headers, buffer, this.targetPolicy.lookup);
+      await this.uploader(uploadUrl!, headers, buffer);
       return { asset_id: directUpload.asset_id };
     }, scopeDigest);
   }
@@ -94,8 +94,7 @@ function validateHeaders(input: Record<string, string>, size: number, contentTyp
 function putBuffer(
   url: URL,
   headers: Record<string, string>,
-  buffer: Buffer,
-  lookup: import("node:net").LookupFunction
+  buffer: Buffer
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const request = https.request(
@@ -103,7 +102,6 @@ function putBuffer(
       {
         method: "PUT",
         headers,
-        lookup,
         timeout: UPLOAD_TIMEOUT_MS,
         maxHeaderSize: 64 * 1024
       },

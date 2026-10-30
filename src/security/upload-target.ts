@@ -1,17 +1,20 @@
-import { lookup as dnsLookup } from "node:dns/promises";
-import type { LookupFunction } from "node:net";
-import ipaddr from "ipaddr.js";
-import { DEFAULT_UPLOAD_HOST_PATTERNS } from "../constants.js";
 import { PluginError } from "../errors.js";
 
+/**
+ * 直传目标的传输形态校验。
+ *
+ * 与下载侧（download-preview-media.ts）一致：服务端是权威，签发什么上传
+ * 目标就按原样上传。不做域名允许列表，也不做 DNS 私网解析防护——
+ * fake-IP 型出网隧道（沙箱环境、Clash fake-ip 等）会把全部域名解析到
+ * RFC 2544 保留段占位地址，真实目的地由隧道按 TLS SNI 转发；自建部署
+ * 也可能使用自有上传域名。DNS 层校验在这两类环境下只会误伤，传输安全
+ * 由仅 HTTPS + TLS 证书校验 + 拒绝重定向保证。
+ */
 export interface UploadTargetPolicy {
   assertUrl(rawUrl: string): URL;
-  lookup: LookupFunction;
 }
 
-export function createUploadTargetPolicy(patterns = configuredHostPatterns()): UploadTargetPolicy {
-  const normalizedPatterns = patterns.map(normalizePattern);
-
+export function createUploadTargetPolicy(): UploadTargetPolicy {
   return {
     assertUrl(rawUrl: string): URL {
       if (rawUrl.length > 8192) throw invalidTarget();
@@ -26,85 +29,18 @@ export function createUploadTargetPolicy(patterns = configuredHostPatterns()): U
         url.username !== "" ||
         url.password !== "" ||
         url.hash !== "" ||
-        (url.port !== "" && url.port !== "443") ||
-        !matchesAllowedHost(url.hostname, normalizedPatterns)
+        (url.port !== "" && url.port !== "443")
       ) {
         throw invalidTarget();
       }
       return url;
-    },
-    lookup: createSecureLookup()
+    }
   };
 }
 
-export function configuredHostPatterns(): string[] {
-  const configured = process.env.QUICK_IMAGE_UPLOAD_HOSTS?.trim();
-  if (!configured) return DEFAULT_UPLOAD_HOST_PATTERNS;
-  const patterns = configured.split(",").map((value) => value.trim()).filter(Boolean);
-  if (patterns.length === 0) throw invalidAllowlist();
-  return patterns;
-}
-
-export function isPublicAddress(value: string): boolean {
-  let address;
-  try {
-    address = ipaddr.parse(value);
-  } catch {
-    return false;
-  }
-  if (address instanceof ipaddr.IPv6 && address.isIPv4MappedAddress()) {
-    address = address.toIPv4Address();
-  }
-  return address.range() === "unicast";
-}
-
-function createSecureLookup(): LookupFunction {
-  return ((hostname: string, options: unknown, callback: (...args: unknown[]) => void) => {
-    void dnsLookup(hostname, { all: true, verbatim: true })
-      .then((addresses) => {
-        if (addresses.length === 0 || addresses.some((entry) => !isPublicAddress(entry.address))) {
-          callback(Object.assign(new Error("Upload target resolved to a blocked address"), { code: "EACCES" }));
-          return;
-        }
-        const wantsAll = typeof options === "object" && options !== null && "all" in options && options.all === true;
-        if (wantsAll) callback(null, addresses);
-        else callback(null, addresses[0]?.address, addresses[0]?.family);
-      })
-      .catch((error: unknown) => callback(error));
-  }) as LookupFunction;
-}
-
-function normalizePattern(value: string): string {
-  const pattern = value.trim().toLowerCase().replace(/\.$/, "");
-  const bare = pattern.startsWith("*.") ? pattern.slice(2) : pattern;
-  if (
-    !bare.includes(".") ||
-    !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(bare) ||
-    (pattern.includes("*") && !pattern.startsWith("*."))
-  ) {
-    throw invalidAllowlist();
-  }
-  return pattern;
-}
-
-function matchesAllowedHost(hostname: string, patterns: string[]): boolean {
-  const host = hostname.toLowerCase().replace(/\.$/, "");
-  return patterns.some((pattern) => {
-    if (!pattern.startsWith("*.")) return host === pattern;
-    const suffix = pattern.slice(1);
-    return host.endsWith(suffix) && host.length > suffix.length;
-  });
-}
-
 function invalidTarget(): PluginError {
-  return new PluginError("UPLOAD_TARGET_REJECTED", "直传目标不符合 Quick Image 上传安全策略。", {
+  return new PluginError("UPLOAD_TARGET_REJECTED", "直传目标不符合 Quick Image 传输策略。", {
     field: "direct_upload.upload_url",
     suggested_action: "重新调用远程 MCP 获取直传信息；不要手工修改 URL。"
-  });
-}
-
-function invalidAllowlist(): PluginError {
-  return new PluginError("UPLOAD_ALLOWLIST_INVALID", "上传域名允许列表配置无效。", {
-    suggested_action: "将 QUICK_IMAGE_UPLOAD_HOSTS 配置为逗号分隔的完整域名或 *.example.com。"
   });
 }
